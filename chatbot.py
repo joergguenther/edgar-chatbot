@@ -76,6 +76,7 @@ def get_conn():
     db = CONFIG["database"]
     if not db.get("password"):
         raise RuntimeError("Database password not configured. Open Settings to configure.")
+    print(f"[db] Connecting to {db['host']}:{db.get('port', 16149)}/{db['dbname']} as {db['user']}")
     return psycopg2.connect(
         host=db["host"], port=db["port"],
         dbname=db["dbname"], user=db["user"],
@@ -208,15 +209,25 @@ def get_schema_context(force_refresh=False):
         ctx = introspect_schema()
         _SCHEMA_CACHE["context"] = ctx
         _SCHEMA_CACHE["updated"] = datetime.utcnow().isoformat()
-        print(f"Schema context refreshed ({len(ctx):,} chars)")
+        # Count tables found
+        table_count = ctx.count("## \"")
+        print(f"[schema] Refreshed: {len(ctx):,} chars, ~{table_count} tables")
         return ctx
     except Exception as e:
-        print(f"Schema introspection failed: {e}")
-        return (
-            f"Database schemas: {CONFIG['database'].get('schema', 'newdev_private_equity')} and "
-            f"{CONFIG['database'].get('reference_schema', 'newdev_public_equity')}. "
-            f"Schema introspection failed ({e}). Query information_schema.tables to discover what exists."
+        print(f"[schema] Introspection FAILED: {e}")
+        traceback.print_exc()
+        # Mark cache as failed with clear marker
+        ctx = (
+            f"SCHEMA_INTROSPECTION_FAILED\n"
+            f"Error: {e}\n"
+            f"Host: {CONFIG['database'].get('host')}\n"
+            f"DB: {CONFIG['database'].get('dbname')}\n"
+            f"Schemas: {CONFIG['database'].get('schema')}, {CONFIG['database'].get('reference_schema')}\n"
+            f"Fix this by opening Settings → Diagnose."
         )
+        _SCHEMA_CACHE["context"] = ctx
+        _SCHEMA_CACHE["updated"] = datetime.utcnow().isoformat()
+        return ctx
 
 
 
@@ -333,15 +344,19 @@ def nl_to_sql(question, conversation_history=None):
     """Translate a natural language question into SQL using Claude."""
     history = conversation_history or []
 
-    # Get schema context FIRST. Fail loudly if empty.
+    # Get schema context FIRST. Fail loudly if empty or failed.
     schema_ctx = get_schema_context()
-    if not schema_ctx or "WARNING: No tables found" in schema_ctx:
+    if not schema_ctx or "WARNING: No tables found" in schema_ctx or "SCHEMA_INTROSPECTION_FAILED" in schema_ctx:
         raise RuntimeError(
-            f"Schema context is empty or missing. "
-            f"Open Settings → Diagnose to see what schemas exist in your DB, "
-            f"then update the PE Schema field to match and click Refresh Schema."
+            f"Schema not loaded. {schema_ctx[:500] if schema_ctx else 'Empty context.'} "
+            f"Open Settings → 🔍 Diagnose to see what's wrong."
         )
-    print(f"[nl_to_sql] schema context: {len(schema_ctx):,} chars")
+    # Also check that we actually have tables in the context
+    if schema_ctx.count("## \"") == 0:
+        raise RuntimeError(
+            "Schema context has no tables. Open Settings → 🔍 Diagnose to see what's in the database."
+        )
+    print(f"[nl_to_sql] schema context: {len(schema_ctx):,} chars, {schema_ctx.count('## \"')} tables")
 
     # Build messages including prior turns — but ONLY include turns whose SQL
     # didn't error out. Including bad SQL in history teaches the LLM to repeat it.
@@ -755,13 +770,33 @@ def api_settings_post():
 def api_schema_refresh():
     """Force a refresh of the schema context from the database."""
     try:
-        _KNOWN_TABLES_CACHE["tables"] = None  # invalidate known tables cache too
+        _KNOWN_TABLES_CACHE["tables"] = None
+        _SCHEMA_CACHE["context"] = None
         ctx = get_schema_context(force_refresh=True)
+
+        # Verify it worked
+        if "SCHEMA_INTROSPECTION_FAILED" in ctx or "WARNING: No tables found" in ctx:
+            return jsonify({
+                "success": False,
+                "error": ctx,
+                "current_db": CONFIG["database"].get("dbname"),
+                "current_schema": CONFIG["database"].get("schema"),
+                "current_ref_schema": CONFIG["database"].get("reference_schema"),
+            }), 400
+
+        # Extract table names for display
+        table_names = re.findall(r'## "([^"]+)"\."([^"]+)"', ctx)
+
         return jsonify({
             "success": True,
             "chars": len(ctx),
             "updated": _SCHEMA_CACHE["updated"],
-            "preview": ctx[:500] + ("..." if len(ctx) > 500 else ""),
+            "table_count": len(table_names),
+            "tables": [f"{s}.{t}" for s, t in table_names],
+            "current_db": CONFIG["database"].get("dbname"),
+            "current_schema": CONFIG["database"].get("schema"),
+            "current_ref_schema": CONFIG["database"].get("reference_schema"),
+            "preview": ctx[:800] + ("..." if len(ctx) > 800 else ""),
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 400
@@ -784,6 +819,10 @@ def api_schema_diagnose():
         conn = get_conn()
         try:
             with conn.cursor() as cur:
+                # Confirm WHICH database we're actually connected to
+                cur.execute("SELECT current_database(), current_user, version()")
+                actual_db, actual_user, version = cur.fetchone()
+
                 # All schemas
                 cur.execute("""
                     SELECT schema_name FROM information_schema.schemata
@@ -803,11 +842,15 @@ def api_schema_diagnose():
                 for schema, table in cur.fetchall():
                     tables_by_schema.setdefault(schema, []).append(table)
 
-                # What the configured schemas have
                 pe_schema = CONFIG["database"].get("schema", "")
                 ref_schema = CONFIG["database"].get("reference_schema", "")
+                configured_db = CONFIG["database"].get("dbname", "")
 
             return jsonify({
+                "configured_dbname": configured_db,
+                "actual_dbname": actual_db,
+                "actual_user": actual_user,
+                "db_matches_config": actual_db == configured_db,
                 "all_schemas": schemas,
                 "configured_pe_schema": pe_schema,
                 "configured_ref_schema": ref_schema,
