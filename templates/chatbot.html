@@ -541,6 +541,7 @@
                 </div>
                 <div style="margin-top: 0.5rem; margin-left: 130px">
                     <button class="btn btn-test" onclick="testDb()">Test Connection</button>
+                    <button class="btn btn-test" onclick="refreshSchema()" title="Re-read tables and columns from the database">🔄 Refresh Schema</button>
                     <div class="test-result" id="dbTestResult"></div>
                 </div>
             </div>
@@ -1238,6 +1239,27 @@ function updateModelDesc() {
 
 function closeSettings() {
     document.getElementById('settingsModal').classList.remove('show');
+}
+
+async function refreshSchema() {
+    const result = document.getElementById('dbTestResult');
+    result.className = 'test-result show';
+    result.textContent = 'Introspecting database schema...';
+    result.style.color = 'var(--text-muted)';
+    try {
+        const resp = await fetch('/api/schema/refresh', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+            result.className = 'test-result show success';
+            result.textContent = `✓ Schema refreshed (${data.chars.toLocaleString()} chars). The chatbot now knows the current table structure.`;
+        } else {
+            result.className = 'test-result show error';
+            result.textContent = `✗ ${data.error}`;
+        }
+    } catch(e) {
+        result.className = 'test-result show error';
+        result.textContent = `✗ ${e.message}`;
+    }
 }
 
 async function testDb() {

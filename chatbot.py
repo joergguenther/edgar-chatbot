@@ -103,149 +103,115 @@ def calc_cost(input_tokens, output_tokens, model_id):
 # SCHEMA CONTEXT — fed to Claude so it knows what to query
 # ──────────────────────────────────────────────────────────────────
 
-SCHEMA_CONTEXT = """
-You are a SQL assistant for a PostgreSQL database containing data extracted from SEC EDGAR filings.
+_SCHEMA_CACHE = {"context": None, "updated": None}
 
-# SCHEMAS
-- `newdev_private_equity` — extracted fund data (34 tables)
-- `newdev_public_equity` — reference tables
 
-IMPORTANT: PostgreSQL requires mixed-case schema/table/column names to be DOUBLE-QUOTED separately.
-Correct:   SELECT * FROM "newdev_private_equity"."T_PE_FUND_SHARE_CLASS_NAV_PRICING"
-Wrong:     SELECT * FROM newdev_private_equity.T_PE_FUND_SHARE_CLASS_NAV_PRICING
+def introspect_schema():
+    """Query the database for actual tables and columns in the configured schemas.
+    Returns a formatted string that goes into Claude's system prompt."""
+    pe_schema = CONFIG["database"].get("schema", "newdev_private_equity")
+    ref_schema = CONFIG["database"].get("reference_schema", "newdev_public_equity")
 
-# REFERENCE TABLES
-`newdev_public_equity"."T_PORT_PORTFOLIO` — fund master
-  Columns: PortfolioID (BIGINT PK), PortfolioName, CIK, FundTypeCode, FundSubTypeCode, CreatedAt
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            # Get all tables + columns for both schemas
+            cur.execute("""
+                SELECT table_schema, table_name, column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema IN (%s, %s)
+                ORDER BY table_schema, table_name, ordinal_position
+            """, (pe_schema, ref_schema))
+            rows = cur.fetchall()
 
-`newdev_public_equity"."T_PORT_SHARE_CLASS` — share class master
-  Columns: ShareClassID (BIGINT PK), PortfolioID (FK), ShareClassName, ShareClassCode
+            # Get primary keys
+            cur.execute("""
+                SELECT tc.table_schema, tc.table_name, kcu.column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                 AND tc.table_schema = kcu.table_schema
+                WHERE tc.constraint_type = 'PRIMARY KEY'
+                  AND tc.table_schema IN (%s, %s)
+                ORDER BY tc.table_name, kcu.ordinal_position
+            """, (pe_schema, ref_schema))
+            pk_rows = cur.fetchall()
+    finally:
+        conn.close()
 
-# FILING MASTER
-`newdev_private_equity"."T_PE_FUND_REGULATORY_FILING_MASTER` — all processed filings
-  Columns: RegulatoryFilingID (BIGINT PK), PortfolioID, FilingType, FilingDate, ReportPeriodEndDate,
-           FilingURL, CIK, AccessionID, RegistrantName, EntityType, SICCode, SYSTEM_INSERTED
+    # Organize columns by table
+    tables = {}
+    for schema, table, col, dtype in rows:
+        key = (schema, table)
+        tables.setdefault(key, []).append((col, dtype))
 
-# EXTRACTION LOG
-`newdev_private_equity"."T_PE_FUND_EXTRACTION_LOG` — every extraction attempt
-  Columns: ExtractionID, CIK, CompanyName, AccessionID, DomainID, DomainName, TargetTable,
-           FilingType, Model, ExtractionMethod, Status (APPROVED/REJECTED/PENDING_REVIEW),
-           RowCount, InputTokens, OutputTokens, CostUSD, FilingURL, FilingDate, ExtractedAt
+    # Organize PKs
+    pks = {}
+    for schema, table, col in pk_rows:
+        pks.setdefault((schema, table), []).append(col)
 
-# ML CORRECTIONS
-`newdev_private_equity"."T_PE_EXTRACTION_CORRECTIONS` — reviewer corrections
-  Columns: CorrectionID, ExtractionID, DomainID, FieldName, OriginalValue, CorrectedValue,
-           CIK, CompanyName, AccessionID, FilingType, CorrectedAt
+    if not tables:
+        return (
+            f"WARNING: No tables found in schemas '{pe_schema}' or '{ref_schema}'.\n"
+            "Check that the schema name in Settings is correct and the DDL has been run."
+        )
 
-# DOMAIN DATA TABLES (34)
-All domain tables have CIK, AccessionID, Source, SYSTEM_INSERTED/UPDATED/CHANGEBY columns.
+    lines = []
+    lines.append("You are a SQL assistant for a PostgreSQL database containing extracted EDGAR fund data.\n")
+    lines.append("# SCHEMAS")
+    lines.append(f"- `{pe_schema}` — extracted fund data")
+    lines.append(f"- `{ref_schema}` — reference tables (portfolios, share classes)")
+    lines.append("")
+    lines.append("CRITICAL: PostgreSQL requires mixed-case schema/table/column names to be DOUBLE-QUOTED separately.")
+    lines.append(f'Correct:   SELECT * FROM "{pe_schema}"."T_PE_FUND_SHARE_CLASS_NAV_PRICING"')
+    lines.append(f'Wrong:     SELECT * FROM {pe_schema}.T_PE_FUND_SHARE_CLASS_NAV_PRICING  (lowercases identifiers)')
+    lines.append("")
+    lines.append("# TABLES (exact names and columns from the live database)")
+    lines.append("")
 
-## NAV & Pricing
-`T_PE_FUND_SHARE_CLASS_NAV_PRICING` (PK: ShareClassID, NAVDate, PortfolioID)
-  NAVDate, NAVPerShare, TotalNetAssets, TotalGrossAssets, SharesOutstanding,
-  OfferingPrice, RepurchasePrice, PremiumDiscount, NAVChangePercent
+    # Sort: reference schema first, then PE tables
+    sorted_tables = sorted(tables.keys(), key=lambda k: (k[0] != ref_schema, k[0], k[1]))
+    for schema, table in sorted_tables:
+        cols = tables[(schema, table)]
+        pk_cols = pks.get((schema, table), [])
+        pk_str = f" — PK: {', '.join(pk_cols)}" if pk_cols else ""
+        lines.append(f'## "{schema}"."{table}"{pk_str}')
+        col_strs = [f'{c} ({t})' for c, t in cols]
+        lines.append(f"  {', '.join(col_strs)}")
+        lines.append("")
 
-`T_PE_FUND_SHARE_CLASS_OFFERING_PRICE` (PK: ShareClassID, PricingDate, PortfolioID)
-  PricingDate, OfferingPrice, PricingBasis (Fixed/NAV/NAV+Load), IncludesLoad, LoadPct
+    lines.append("# QUERY GUIDELINES")
+    lines.append("1. ALWAYS use the exact schema and table names shown above, with double quotes.")
+    lines.append("2. Filter by CIK when searching for a specific company — CIKs are usually stored without leading zeros.")
+    lines.append("3. LIMIT all queries to 500 rows maximum.")
+    lines.append("4. Join via PortfolioID or ShareClassID, not on CIK alone.")
+    lines.append("5. Dates are DATE type. Use 'YYYY-MM-DD' literals.")
+    lines.append('6. For "most recent", use ORDER BY <date_col> DESC LIMIT 1.')
+    lines.append("7. Return ONLY the SQL query — no explanation, no markdown, no backticks.")
+    lines.append("8. If a table name or column name contains mixed case, you MUST double-quote it.")
 
-## Distributions
-`T_PE_FUND_SHARE_CLASS_DISTRIBUTION` (PK: ShareClassID, PortfolioID, PaymentDate, Type)
-  PaymentDate, RecordDate, DeclarationDate, Type (Regular/Special/Return of Capital),
-  DistributionPerShare, DistributionAmount, Frequency, SpecialIndicator
+    return "\n".join(lines)
 
-`T_PE_FUND_SHARE_CLASS_DISTRIBUTIONS_YTD` (PK: ShareClassID, PortfolioID, PeriodEndDate)
-  PeriodEndDate, TotalDistributionsYTD, DistributionsFromIncome, DistributionsFromCapitalGains,
-  DistributionsFromReturnOfCapital
 
-`T_PE_FUND_SHARE_CLASS_DISTRIBUTIONS_DRIP_SCHEDULE` — reinvestment plan details
-`T_PE_FUND_SHARE_CLASS_DISTRIBUTION_METRICS` — annualized rate, yield, coverage
-`T_PE_FUND_DISTRIBUTIONS_TAX` — tax character (ordinary/capital gains/ROC)
+def get_schema_context(force_refresh=False):
+    """Return cached schema context, introspecting if needed."""
+    if _SCHEMA_CACHE["context"] and not force_refresh:
+        return _SCHEMA_CACHE["context"]
+    try:
+        ctx = introspect_schema()
+        _SCHEMA_CACHE["context"] = ctx
+        _SCHEMA_CACHE["updated"] = datetime.utcnow().isoformat()
+        print(f"Schema context refreshed ({len(ctx):,} chars)")
+        return ctx
+    except Exception as e:
+        print(f"Schema introspection failed: {e}")
+        return (
+            f"Database schemas: {CONFIG['database'].get('schema', 'newdev_private_equity')} and "
+            f"{CONFIG['database'].get('reference_schema', 'newdev_public_equity')}. "
+            f"Schema introspection failed ({e}). Query information_schema.tables to discover what exists."
+        )
 
-## Composition
-`T_PE_FUND_COMPOSITION_ACTUALS` (PK: PortfolioID, ReportDate, NodeType, NodeName)
-  ReportDate, NodeType (Asset Class/Industry/Geography/Security Type),
-  NodeLevel, SubNodeLevel, NodeName, AllocationPercent, FairValue, Cost, NumberOfPositions
 
-`T_PE_FUND_COMPOSITION_OBJECTIVES` — target/policy allocations
-
-## Leverage
-`T_PE_FUND_LEVERAGE_DETAIL` (PK: PortfolioID, FacilityName, ReportDate)
-  FacilityName, FacilityType, ReportDate, CommittedAmount, DrawnAmount, AvailableAmount,
-  InterestRate, MaturityDate, Lender
-
-`T_INST_PE_FUND_LEVERAGE_SUMMARY` — aggregate borrowings, asset coverage
-`T_PE_FUND_LEVERAGE_COVENANT_COMPLIANCE` — covenant tests and ratios
-
-## Performance
-`T_PE_FUND_SHARE_CLASS_RETURNS` (PK: ShareClassID, PortfolioID, ReportDate)
-  ReportDate, Return1Month, Return3Month, ReturnYTD, Return1Year, Return3Year,
-  Return5Year, Return10Year, ReturnSinceInception, InceptionDate, BenchmarkName, BenchmarkReturn1Year
-
-`T_PE_FUND_SHARE_CLASS_VOLATILITY` — standard deviation, Sharpe, beta, alpha
-
-## Fees
-`T_PE_FUND_FEES` (PK: ShareClassID, PortfolioID, EffectiveDate)
-  EffectiveDate, ManagementFeePercent, IncentiveFeePercent, AdminFeePercent,
-  TotalExpenseRatio, ExpenseCap, WaiverEndDate, PerformanceFee
-
-## Shares Outstanding
-`T_PE_FUND_SHARE_CLASS_SHARES_OUTSTANDING` (PK: ShareClassID, PortfolioID, ReportDate)
-  ReportDate, SharesOutstanding, SharesAuthorized, SharesIssued
-
-## Operational
-`T_PE_FUND_MASTER_OPERATIONAL_DETAILS` (PK: PortfolioID)
-  InceptionDate, FiscalYearEnd, FundManager, SubAdviser, Custodian, Auditor,
-  TransferAgent, LegalCounsel, Administrator, Distributor, DomicileCountry
-
-## Liquidity
-`T_PE_FUND_REDEMPTIONS` — repurchase/redemption programs
-`T_PE_FUND_LIQUIDATION_PROGRAM` — wind-down plans
-`T_PE_FUND_DEATH_DISABILITY` — death/disability benefit provisions
-`T_PE_FUND_SHARE_CONVERSION_PROGRAM` — class conversion features
-`T_PE_FUND_SHARE_CLASS_LIQUIDITY` — share class liquidity events
-
-## Interval Fund (for interval funds)
-`T_PE_FUND_INTERVAL_FUND_DETAIL`, `T_PE_FUND_INTERVAL_FUND_NEXT_DATES`,
-`T_PE_FUND_INTERVAL_FUND_GATE_PROVISIONS`, `T_PE_FUND_INTERVAL_FUND_SUSPENSION_FRAMEWORK`,
-`T_PE_FUND_SHARE_CLASS_INTERVAL_FUND_EARLY_WITHDRAWAL`
-
-## Tender Offer (for tender offer funds)
-`T_PE_FUND_TENDER_OFFER_PROGRAM`, `T_PE_FUND_TENDER_OFFER_FUND_NEXT_DATES`,
-`T_PE_FUND_TENDER_OFFER_SUSPENSION_FRAMEWORK`
-
-## Other
-`T_PE_FUND_REPURCHASE_FEES` — early redemption penalties
-`T_PE_FUND_SHARE_CLASS_INVESTOR_ELIGIBILITY` — accredited investor requirements
-`T_PE_FUND_SHARE_CLASS_ACCOUNT_METRICS` — number of accounts/shareholders
-
-# QUERY PATTERNS
-
-## "Most recent 10-K for CIK X"
-SELECT * FROM "newdev_private_equity"."T_PE_FUND_REGULATORY_FILING_MASTER"
-WHERE "CIK" = 'X' AND "FilingType" = '10-K'
-ORDER BY "FilingDate" DESC LIMIT 1
-
-## "Latest NAV for fund X"
-SELECT sc."ShareClassName", nav."NAVDate", nav."NAVPerShare"
-FROM "newdev_private_equity"."T_PE_FUND_SHARE_CLASS_NAV_PRICING" nav
-JOIN "newdev_public_equity"."T_PORT_SHARE_CLASS" sc ON sc."ShareClassID" = nav."ShareClassID"
-JOIN "newdev_public_equity"."T_PORT_PORTFOLIO" p ON p."PortfolioID" = nav."PortfolioID"
-WHERE p."CIK" = 'X'
-ORDER BY nav."NAVDate" DESC
-
-## "How many extractions have we run?"
-SELECT COUNT(*), "Status" FROM "newdev_private_equity"."T_PE_FUND_EXTRACTION_LOG"
-GROUP BY "Status"
-
-# SQL GUIDELINES
-1. ALWAYS use double-quoted identifiers for schema, table, and column names.
-2. Filter by CIK when searching for a specific company — CIKs are stored with leading zeros stripped.
-3. LIMIT all queries to 500 rows maximum.
-4. Join via PortfolioID or ShareClassID — don't join on CIK alone (duplicates possible).
-5. Dates are DATE type, not TIMESTAMP. Use 'YYYY-MM-DD' literals.
-6. For "most recent", use ORDER BY date DESC LIMIT 1.
-7. Return ONLY the SQL query — no explanation, no markdown, no backticks.
-"""
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -296,7 +262,7 @@ def nl_to_sql(question, conversation_history=None):
         "content": f"Generate a PostgreSQL query to answer this question: {question}\n\nReturn ONLY the SQL query. Start with SELECT. No backticks, no explanation."
     })
 
-    sql, usage = call_claude(messages, system=SCHEMA_CONTEXT)
+    sql, usage = call_claude(messages, system=get_schema_context())
 
     # Clean up the SQL
     sql = re.sub(r"^```(?:sql)?\s*", "", sql)
@@ -648,7 +614,35 @@ def api_settings_post():
 
     save_config(cfg)
     CONFIG = cfg  # reload in-memory copy
+    # Invalidate schema cache so next query re-introspects with new DB settings
+    _SCHEMA_CACHE["context"] = None
+    _SCHEMA_CACHE["updated"] = None
     return jsonify({"success": True})
+
+
+@app.route("/api/schema/refresh", methods=["POST"])
+def api_schema_refresh():
+    """Force a refresh of the schema context from the database."""
+    try:
+        ctx = get_schema_context(force_refresh=True)
+        return jsonify({
+            "success": True,
+            "chars": len(ctx),
+            "updated": _SCHEMA_CACHE["updated"],
+            "preview": ctx[:500] + ("..." if len(ctx) > 500 else ""),
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/api/schema")
+def api_schema_get():
+    """Return the current schema context (for inspection/debugging)."""
+    return jsonify({
+        "context": get_schema_context(),
+        "updated": _SCHEMA_CACHE["updated"],
+        "chars": len(_SCHEMA_CACHE["context"] or ""),
+    })
 
 
 @app.route("/api/settings/test-db", methods=["POST"])
