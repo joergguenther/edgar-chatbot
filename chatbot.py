@@ -343,19 +343,29 @@ def execute_sql(sql, max_rows=500):
     if not sql_stripped.startswith("SELECT") and not sql_stripped.startswith("WITH"):
         raise ValueError("Only SELECT queries are allowed")
 
-    # Block dangerous keywords
-    forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE",
-                 "CREATE", "GRANT", "REVOKE", "COPY", "--", "/*"]
-    for kw in forbidden:
+    # Block SQL comments (can be used to hide malicious code after a LIMIT injection)
+    if "--" in sql or "/*" in sql or "*/" in sql:
+        raise ValueError("SQL comments are not allowed")
+
+    # Block dangerous keywords — use word-boundary regex on actual keywords only
+    forbidden_kw = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE",
+                    "CREATE", "GRANT", "REVOKE", "COPY", "VACUUM", "ANALYZE",
+                    "REINDEX", "CLUSTER", "LOCK", "EXECUTE", "CALL"]
+    for kw in forbidden_kw:
         if re.search(rf"\b{kw}\b", sql, re.IGNORECASE):
             raise ValueError(f"Forbidden keyword in SQL: {kw}")
+
+    # Block multiple statements (semicolon not at the very end)
+    sql_no_trailing = sql.rstrip().rstrip(";").rstrip()
+    if ";" in sql_no_trailing:
+        raise ValueError("Multiple SQL statements are not allowed")
 
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             # Wrap in a LIMIT if there isn't one
             if "LIMIT" not in sql.upper():
-                sql_with_limit = sql.rstrip(";") + f" LIMIT {max_rows}"
+                sql_with_limit = sql.rstrip().rstrip(";") + f" LIMIT {max_rows}"
             else:
                 sql_with_limit = sql
 
