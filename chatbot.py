@@ -44,9 +44,12 @@ def load_config():
             "model": "claude-sonnet-4-6",
         },
         "models": [
-            {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "description": "Most capable, slower, higher cost"},
-            {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "description": "Balanced — recommended default"},
-            {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5", "description": "Fastest and cheapest"},
+            {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "description": "Most capable, slower, higher cost",
+             "input_price": 15.0, "output_price": 75.0},
+            {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "description": "Balanced — recommended default",
+             "input_price": 3.0, "output_price": 15.0},
+            {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5", "description": "Fastest and cheapest",
+             "input_price": 1.0, "output_price": 5.0},
         ],
         "app": {
             "port": 5100,
@@ -78,6 +81,22 @@ def get_conn():
         dbname=db["dbname"], user=db["user"],
         password=db["password"], sslmode=db.get("sslmode", "require"),
     )
+
+
+def get_model_pricing(model_id):
+    """Return (input_price_per_mtok, output_price_per_mtok) for a model."""
+    for m in CONFIG.get("models", []):
+        if m.get("id") == model_id:
+            return float(m.get("input_price", 0)), float(m.get("output_price", 0))
+    # Fallback defaults for unknown models
+    return 3.0, 15.0
+
+
+def calc_cost(input_tokens, output_tokens, model_id):
+    """Calculate USD cost from token counts. Prices are per million tokens."""
+    in_price, out_price = get_model_pricing(model_id)
+    cost = (input_tokens * in_price + output_tokens * out_price) / 1_000_000
+    return round(cost, 6)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -418,6 +437,14 @@ def api_ask():
         else:
             answer, summary_usage = summarize_results(question, sql, rows, columns)
 
+        # Calculate cost
+        model_id = CONFIG["anthropic"].get("model", "claude-sonnet-4-6")
+        total_input = sql_usage.get("input_tokens", 0) + summary_usage.get("input_tokens", 0)
+        total_output = sql_usage.get("output_tokens", 0) + summary_usage.get("output_tokens", 0)
+        sql_cost = calc_cost(sql_usage.get("input_tokens", 0), sql_usage.get("output_tokens", 0), model_id)
+        summary_cost = calc_cost(summary_usage.get("input_tokens", 0), summary_usage.get("output_tokens", 0), model_id)
+        total_cost = round(sql_cost + summary_cost, 6)
+
         # Save turn to conversation
         turn = {
             "user": question,
@@ -428,15 +455,26 @@ def api_ask():
             "rows_preview": rows[:20],
             "timestamp": datetime.utcnow().isoformat(),
             "error": error,
+            "model": model_id,
             "usage": {
                 "sql_input_tokens": sql_usage.get("input_tokens", 0),
                 "sql_output_tokens": sql_usage.get("output_tokens", 0),
                 "summary_input_tokens": summary_usage.get("input_tokens", 0),
                 "summary_output_tokens": summary_usage.get("output_tokens", 0),
+                "total_input_tokens": total_input,
+                "total_output_tokens": total_output,
+                "sql_cost_usd": sql_cost,
+                "summary_cost_usd": summary_cost,
+                "total_cost_usd": total_cost,
             }
         }
         conv["turns"].append(turn)
         save_conversation(conv)
+
+        # Compute conversation-level totals
+        conv_total_cost = sum(t.get("usage", {}).get("total_cost_usd", 0) for t in conv["turns"])
+        conv_total_input = sum(t.get("usage", {}).get("total_input_tokens", 0) for t in conv["turns"])
+        conv_total_output = sum(t.get("usage", {}).get("total_output_tokens", 0) for t in conv["turns"])
 
         return jsonify({
             "conversation_id": conv["id"],
@@ -448,7 +486,14 @@ def api_ask():
             "rows": rows[:100],  # limit payload
             "total_rows": len(rows),
             "error": error,
+            "model": model_id,
             "usage": turn["usage"],
+            "conversation_totals": {
+                "total_cost_usd": round(conv_total_cost, 6),
+                "total_input_tokens": conv_total_input,
+                "total_output_tokens": conv_total_output,
+                "turn_count": len(conv["turns"]),
+            }
         })
 
     except Exception as e:
@@ -659,6 +704,43 @@ def api_settings_test_api():
             return jsonify({"success": False, "error": f"HTTP {resp.status_code}: {msg}"}), 400
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/api/stats")
+def api_stats():
+    """Return aggregate usage statistics across all conversations."""
+    total_cost = 0.0
+    total_input = 0
+    total_output = 0
+    total_turns = 0
+    total_convs = 0
+    cost_by_model = {}
+
+    for path in CONVERSATIONS_DIR.glob("*.json"):
+        try:
+            with open(path) as f:
+                conv = json.load(f)
+            total_convs += 1
+            for turn in conv.get("turns", []):
+                total_turns += 1
+                usage = turn.get("usage", {})
+                cost = usage.get("total_cost_usd", 0)
+                total_cost += cost
+                total_input += usage.get("total_input_tokens", 0)
+                total_output += usage.get("total_output_tokens", 0)
+                model = turn.get("model", "unknown")
+                cost_by_model[model] = cost_by_model.get(model, 0) + cost
+        except Exception:
+            continue
+
+    return jsonify({
+        "total_cost_usd": round(total_cost, 6),
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_turns": total_turns,
+        "total_conversations": total_convs,
+        "cost_by_model": {m: round(c, 6) for m, c in cost_by_model.items()},
+    })
 
 
 @app.route("/api/health")

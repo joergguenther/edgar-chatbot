@@ -193,6 +193,13 @@
         border-radius: 4px; cursor: pointer; font-size: 0.7rem;
     }
     .sql-toggle:hover { background: var(--bg-hover); color: var(--text); }
+    .cost-pill {
+        background: rgba(245, 158, 11, 0.12); color: var(--amber);
+        padding: 0.15rem 0.5rem; border-radius: 4px;
+        font-size: 0.7rem; font-weight: 600;
+        border: 1px solid rgba(245, 158, 11, 0.25);
+        cursor: help;
+    }
     .sql-panel {
         margin-top: 0.5rem; padding: 0.7rem;
         background: var(--bg); border: 1px solid var(--border);
@@ -401,6 +408,12 @@
             <span id="healthText">Checking...</span>
         </div>
         <div style="font-size:0.68rem; color: var(--text-muted); margin-top:0.3rem; font-family:var(--mono); opacity:0.8" id="currentModel"></div>
+        <div id="sessionCostRow" style="font-size:0.7rem; color: var(--text-muted); margin-top:0.5rem; display:none">
+            <div>Session: <span id="sessionCost" style="color:var(--amber); font-weight:600">$0.00</span></div>
+        </div>
+        <div id="allTimeCostRow" style="font-size:0.7rem; color: var(--text-muted); margin-top:0.2rem; cursor:help" title="All-time spend across all conversations">
+            All-time: <span id="allTimeCost" style="color:var(--text-muted); font-weight:600">—</span>
+        </div>
     </div>
 </aside>
 
@@ -427,6 +440,7 @@
                     <div>
                         <select id="settingsModel"></select>
                         <div class="field-help" id="modelDesc">The model used to generate SQL and summarize results</div>
+                        <div class="field-help" id="modelPricing" style="margin-top:0.2rem; color:var(--amber)"></div>
                     </div>
                 </div>
                 <div style="margin-top: 0.5rem; margin-left: 130px">
@@ -681,9 +695,18 @@ async function loadConversation(convId) {
         document.getElementById('welcome').style.display = 'none';
         const messages = document.getElementById('messages');
         messages.innerHTML = '';
+        let sessionTotal = 0;
         conv.turns.forEach(t => {
             messages.innerHTML += renderTurn(t);
+            sessionTotal += (t.usage?.total_cost_usd || 0);
         });
+        // Update session cost display
+        const sc = document.getElementById('sessionCost');
+        const row = document.getElementById('sessionCostRow');
+        if (sc && row) {
+            sc.textContent = formatCost(sessionTotal);
+            row.style.display = 'block';
+        }
         loadConversations();  // refresh active state
         scrollToBottom();
     } catch(e) {
@@ -696,6 +719,9 @@ function newConversation() {
     document.getElementById('messages').innerHTML = '';
     document.getElementById('welcome').style.display = 'block';
     document.getElementById('questionInput').focus();
+    // Hide session cost (new conversation has no turns yet)
+    const row = document.getElementById('sessionCostRow');
+    if (row) row.style.display = 'none';
     loadConversations();
 }
 
@@ -722,12 +748,21 @@ function renderTurn(turn) {
         </div>`;
     }
 
+    // Cost pill
+    const usage = turn.usage || {};
+    const cost = usage.total_cost_usd || 0;
+    const inTok = usage.total_input_tokens || 0;
+    const outTok = usage.total_output_tokens || 0;
+    const costStr = cost > 0 ? formatCost(cost) : '';
+    const tokensTitle = `Input: ${inTok.toLocaleString()} tokens · Output: ${outTok.toLocaleString()} tokens\nSQL: ${formatCost(usage.sql_cost_usd || 0)}\nSummary: ${formatCost(usage.summary_cost_usd || 0)}${turn.model ? '\nModel: ' + turn.model : ''}`;
+
     return `
         <div class="turn">
             <div class="user-msg">${escapeHtml(turn.user)}</div>
             <div class="assistant-msg">${renderMarkdown(turn.assistant_answer || '')}</div>
             <div class="turn-meta">
                 ${turn.row_count ? `<span>${turn.row_count} row${turn.row_count !== 1 ? 's' : ''}</span>` : ''}
+                ${costStr ? `<span class="cost-pill" title="${escapeHtml(tokensTitle)}">💰 ${costStr}</span>` : ''}
                 <button class="sql-toggle" onclick="toggleEl('${sqlId}')">📝 SQL</button>
                 ${hasRows ? `<button class="sql-toggle" onclick="toggleEl('${tableId}')">📊 Data</button>` : ''}
             </div>
@@ -735,6 +770,14 @@ function renderTurn(turn) {
             ${tableHtml}
         </div>
     `;
+}
+
+function formatCost(usd) {
+    if (usd === 0) return '$0.00';
+    if (usd < 0.001) return '$' + (usd * 1000).toFixed(3) + 'm';  // millicents
+    if (usd < 0.01) return '$' + usd.toFixed(5);
+    if (usd < 1) return '$' + usd.toFixed(4);
+    return '$' + usd.toFixed(2);
 }
 
 function toggleEl(id) {
@@ -799,8 +842,20 @@ async function sendQuestion() {
                 row_count: data.row_count,
                 columns: data.columns,
                 rows_preview: data.rows,
+                usage: data.usage,
+                model: data.model,
             });
             loadConversations();
+            // Update session total cost
+            if (data.conversation_totals) {
+                const sc = document.getElementById('sessionCost');
+                const row = document.getElementById('sessionCostRow');
+                if (sc && row) {
+                    sc.textContent = formatCost(data.conversation_totals.total_cost_usd || 0);
+                    row.style.display = 'block';
+                }
+            }
+            loadAllTimeStats();
         }
         scrollToBottom();
     } catch(e) {
@@ -813,6 +868,29 @@ async function sendQuestion() {
         sendBtn.textContent = 'Send';
         input.focus();
     }
+}
+
+async function loadAllTimeStats() {
+    try {
+        const resp = await fetch('/api/stats');
+        const data = await resp.json();
+        const el = document.getElementById('allTimeCost');
+        if (el) {
+            el.textContent = formatCost(data.total_cost_usd || 0);
+            const tooltip = [
+                `Total: ${formatCost(data.total_cost_usd || 0)}`,
+                `${data.total_turns} turns across ${data.total_conversations} conversations`,
+                `Input tokens: ${(data.total_input_tokens || 0).toLocaleString()}`,
+                `Output tokens: ${(data.total_output_tokens || 0).toLocaleString()}`,
+                '',
+                'By model:',
+                ...Object.entries(data.cost_by_model || {}).map(
+                    ([m, c]) => `  ${m}: ${formatCost(c)}`
+                ),
+            ].join('\n');
+            el.parentElement.title = tooltip;
+        }
+    } catch(e) { /* ignore */ }
 }
 
 async function checkHealth() {
@@ -885,6 +963,12 @@ function updateModelDesc() {
     const model = availableModels.find(m => m.id === selected);
     document.getElementById('modelDesc').textContent =
         model?.description || 'The model used to generate SQL and summarize results';
+    const pricing = document.getElementById('modelPricing');
+    if (model && (model.input_price || model.output_price)) {
+        pricing.textContent = `💰 Input: $${model.input_price}/MTok · Output: $${model.output_price}/MTok`;
+    } else {
+        pricing.textContent = '';
+    }
 }
 
 function closeSettings() {
@@ -1002,6 +1086,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 loadSuggestions();
 loadConversations();
+loadAllTimeStats();
 checkHealth();
 setInterval(checkHealth, 30000);
 </script>
