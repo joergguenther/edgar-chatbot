@@ -277,10 +277,111 @@
         cursor: pointer; font-size: 0.75rem; color: var(--text);
         z-index: 10;
     }
+
+    /* Settings modal */
+    .modal-overlay {
+        position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+        display: none; align-items: center; justify-content: center;
+        z-index: 100; backdrop-filter: blur(2px);
+    }
+    .modal-overlay.show { display: flex; }
+    .modal {
+        background: var(--bg-elev); border: 1px solid var(--border);
+        border-radius: 12px; width: 90%; max-width: 640px;
+        max-height: 85vh; overflow-y: auto;
+        box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+    }
+    .modal-header {
+        padding: 1rem 1.3rem; border-bottom: 1px solid var(--border);
+        display: flex; justify-content: space-between; align-items: center;
+        position: sticky; top: 0; background: var(--bg-elev); z-index: 1;
+    }
+    .modal-title { font-size: 1.05rem; font-weight: 700; }
+    .modal-close {
+        background: none; border: none; color: var(--text-muted);
+        font-size: 1.3rem; cursor: pointer; padding: 0 0.3rem;
+    }
+    .modal-close:hover { color: var(--text); }
+    .modal-body { padding: 1.3rem; }
+    .settings-section {
+        margin-bottom: 1.5rem;
+    }
+    .settings-section-title {
+        font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+        color: var(--accent); margin-bottom: 0.6rem;
+        letter-spacing: 0.05em;
+    }
+    .field-row {
+        display: grid; grid-template-columns: 130px 1fr; gap: 0.75rem;
+        align-items: center; margin-bottom: 0.6rem;
+    }
+    .field-row label {
+        font-size: 0.8rem; color: var(--text-muted);
+    }
+    .field-row input, .field-row select {
+        background: var(--bg); border: 1px solid var(--border);
+        color: var(--text); padding: 0.45rem 0.6rem;
+        border-radius: 6px; font-size: 0.85rem;
+        font-family: inherit; width: 100%;
+        transition: border-color 0.15s;
+    }
+    .field-row input:focus, .field-row select:focus {
+        outline: none; border-color: var(--accent);
+    }
+    .field-row input[type="password"] {
+        font-family: var(--mono);
+    }
+    .model-option-desc {
+        font-size: 0.72rem; color: var(--text-muted);
+        margin-top: 0.2rem; grid-column: 2;
+    }
+    .modal-footer {
+        padding: 0.9rem 1.3rem; border-top: 1px solid var(--border);
+        display: flex; gap: 0.5rem; justify-content: space-between;
+        align-items: center;
+        position: sticky; bottom: 0; background: var(--bg-elev);
+    }
+    .modal-footer .left-btns { display: flex; gap: 0.5rem; }
+    .modal-footer .right-btns { display: flex; gap: 0.5rem; }
+    .btn {
+        padding: 0.5rem 0.9rem; border-radius: 6px; cursor: pointer;
+        font-weight: 600; font-size: 0.82rem; border: 1px solid var(--border);
+        background: var(--bg); color: var(--text);
+        transition: all 0.15s;
+    }
+    .btn:hover { background: var(--bg-hover); }
+    .btn-primary {
+        background: var(--accent); color: white; border-color: var(--accent);
+    }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-test {
+        background: none; color: var(--accent); border-color: var(--accent);
+    }
+    .btn-test:hover { background: rgba(99, 102, 241, 0.1); }
+    .test-result {
+        font-size: 0.75rem; margin-top: 0.4rem; padding: 0.35rem 0.55rem;
+        border-radius: 5px; display: none;
+    }
+    .test-result.show { display: block; }
+    .test-result.success {
+        background: rgba(16, 185, 129, 0.1);
+        color: var(--green);
+        border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+    .test-result.error {
+        background: rgba(239, 68, 68, 0.1);
+        color: var(--red);
+        border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+    .field-help {
+        font-size: 0.7rem; color: var(--text-muted);
+        margin-top: 0.25rem;
+    }
 </style>
 </head>
 <body>
 
+<button class="theme-toggle" style="right: 7.5rem" onclick="openSettings()">⚙️ Settings</button>
 <button class="theme-toggle" onclick="toggleTheme()">🌓 Theme</button>
 
 <aside class="sidebar">
@@ -299,8 +400,117 @@
             <span class="dot" id="healthDot"></span>
             <span id="healthText">Checking...</span>
         </div>
+        <div style="font-size:0.68rem; color: var(--text-muted); margin-top:0.3rem; font-family:var(--mono); opacity:0.8" id="currentModel"></div>
     </div>
 </aside>
+
+<!-- Settings Modal -->
+<div class="modal-overlay" id="settingsModal" onclick="if (event.target === this) closeSettings()">
+    <div class="modal">
+        <div class="modal-header">
+            <div class="modal-title">⚙️ Settings</div>
+            <button class="modal-close" onclick="closeSettings()">×</button>
+        </div>
+        <div class="modal-body">
+
+            <div class="settings-section">
+                <div class="settings-section-title">LLM Configuration</div>
+                <div class="field-row">
+                    <label>API Key</label>
+                    <div>
+                        <input type="password" id="settingsApiKey" placeholder="sk-ant-api03-...">
+                        <div class="field-help">Your Anthropic API key (stored in chatbot_config.json)</div>
+                    </div>
+                </div>
+                <div class="field-row">
+                    <label>Model</label>
+                    <div>
+                        <select id="settingsModel"></select>
+                        <div class="field-help" id="modelDesc">The model used to generate SQL and summarize results</div>
+                    </div>
+                </div>
+                <div style="margin-top: 0.5rem; margin-left: 130px">
+                    <button class="btn btn-test" onclick="testApi()">Test API Connection</button>
+                    <div class="test-result" id="apiTestResult"></div>
+                </div>
+            </div>
+
+            <div class="settings-section">
+                <div class="settings-section-title">Database Connection</div>
+                <div class="field-row">
+                    <label>Host</label>
+                    <input type="text" id="settingsDbHost" placeholder="db.example.com">
+                </div>
+                <div class="field-row">
+                    <label>Port</label>
+                    <input type="number" id="settingsDbPort" placeholder="5432">
+                </div>
+                <div class="field-row">
+                    <label>Database</label>
+                    <input type="text" id="settingsDbName" placeholder="defaultdb">
+                </div>
+                <div class="field-row">
+                    <label>User</label>
+                    <input type="text" id="settingsDbUser" placeholder="username">
+                </div>
+                <div class="field-row">
+                    <label>Password</label>
+                    <input type="password" id="settingsDbPassword" placeholder="••••••••">
+                </div>
+                <div class="field-row">
+                    <label>Schema (PE)</label>
+                    <input type="text" id="settingsDbSchema" placeholder="newdev_private_equity">
+                </div>
+                <div class="field-row">
+                    <label>Reference Schema</label>
+                    <input type="text" id="settingsDbRefSchema" placeholder="newdev_public_equity">
+                </div>
+                <div class="field-row">
+                    <label>SSL Mode</label>
+                    <select id="settingsDbSslMode">
+                        <option value="require">require</option>
+                        <option value="prefer">prefer</option>
+                        <option value="disable">disable</option>
+                        <option value="verify-ca">verify-ca</option>
+                        <option value="verify-full">verify-full</option>
+                    </select>
+                </div>
+                <div style="margin-top: 0.5rem; margin-left: 130px">
+                    <button class="btn btn-test" onclick="testDb()">Test Connection</button>
+                    <div class="test-result" id="dbTestResult"></div>
+                </div>
+            </div>
+
+            <div class="settings-section">
+                <div class="settings-section-title">Query Options</div>
+                <div class="field-row">
+                    <label>Max Rows</label>
+                    <div>
+                        <input type="number" id="settingsMaxRows" placeholder="500" min="1" max="10000">
+                        <div class="field-help">Maximum rows returned per query</div>
+                    </div>
+                </div>
+                <div class="field-row">
+                    <label>Context Turns</label>
+                    <div>
+                        <input type="number" id="settingsConvLimit" placeholder="20" min="1" max="100">
+                        <div class="field-help">Past conversation turns to include for follow-up context</div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+        <div class="modal-footer">
+            <div class="left-btns">
+                <span id="saveStatus" style="font-size:0.78rem;color:var(--text-muted)"></span>
+            </div>
+            <div class="right-btns">
+                <button class="btn" onclick="closeSettings()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
+            </div>
+        </div>
+    </div>
+</div>
 
 <main class="main">
     <div class="chat-container" id="chatContainer">
@@ -611,6 +821,7 @@ async function checkHealth() {
         const data = await resp.json();
         const dot = document.getElementById('healthDot');
         const text = document.getElementById('healthText');
+        const modelEl = document.getElementById('currentModel');
         if (data.db === 'connected' && data.has_api_key) {
             dot.classList.remove('bad');
             text.textContent = 'DB connected';
@@ -618,11 +829,176 @@ async function checkHealth() {
             dot.classList.add('bad');
             text.textContent = !data.has_api_key ? 'No API key' : 'DB offline';
         }
+        if (modelEl) modelEl.textContent = data.current_model || '';
     } catch(e) {
         document.getElementById('healthDot').classList.add('bad');
         document.getElementById('healthText').textContent = 'Server offline';
     }
 }
+
+// ── SETTINGS ────────────────────────────────────────────────────
+let availableModels = [];
+
+async function openSettings() {
+    document.getElementById('settingsModal').classList.add('show');
+    document.getElementById('apiTestResult').classList.remove('show');
+    document.getElementById('dbTestResult').classList.remove('show');
+    document.getElementById('saveStatus').textContent = '';
+    try {
+        const resp = await fetch('/api/settings');
+        const data = await resp.json();
+
+        // Database
+        const db = data.database || {};
+        document.getElementById('settingsDbHost').value = db.host || '';
+        document.getElementById('settingsDbPort').value = db.port || '';
+        document.getElementById('settingsDbName').value = db.dbname || '';
+        document.getElementById('settingsDbUser').value = db.user || '';
+        document.getElementById('settingsDbPassword').value = db.password || '';
+        document.getElementById('settingsDbSchema').value = db.schema || '';
+        document.getElementById('settingsDbRefSchema').value = db.reference_schema || '';
+        document.getElementById('settingsDbSslMode').value = db.sslmode || 'require';
+
+        // Anthropic
+        const a = data.anthropic || {};
+        document.getElementById('settingsApiKey').value = a.api_key || '';
+
+        // Models dropdown
+        availableModels = data.models || [];
+        const modelSel = document.getElementById('settingsModel');
+        modelSel.innerHTML = availableModels.map(m =>
+            `<option value="${escapeHtml(m.id)}"${m.id === a.model ? ' selected' : ''}>${escapeHtml(m.name || m.id)}</option>`
+        ).join('');
+        updateModelDesc();
+
+        // App
+        const ap = data.app || {};
+        document.getElementById('settingsMaxRows').value = ap.max_rows || 500;
+        document.getElementById('settingsConvLimit').value = ap.conversation_limit || 20;
+    } catch(e) {
+        console.error('Failed to load settings:', e);
+    }
+}
+
+function updateModelDesc() {
+    const selected = document.getElementById('settingsModel').value;
+    const model = availableModels.find(m => m.id === selected);
+    document.getElementById('modelDesc').textContent =
+        model?.description || 'The model used to generate SQL and summarize results';
+}
+
+function closeSettings() {
+    document.getElementById('settingsModal').classList.remove('show');
+}
+
+async function testDb() {
+    const result = document.getElementById('dbTestResult');
+    result.className = 'test-result show';
+    result.textContent = 'Testing connection...';
+    result.style.color = 'var(--text-muted)';
+    try {
+        const resp = await fetch('/api/settings/test-db', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ database: gatherDbSettings() }),
+        });
+        const data = await resp.json();
+        if (data.success) {
+            result.className = 'test-result show success';
+            result.textContent = `✓ Connected to ${data.database} as ${data.user} (${data.version || 'unknown'})`;
+        } else {
+            result.className = 'test-result show error';
+            result.textContent = `✗ ${data.error}`;
+        }
+    } catch(e) {
+        result.className = 'test-result show error';
+        result.textContent = `✗ ${e.message}`;
+    }
+}
+
+async function testApi() {
+    const result = document.getElementById('apiTestResult');
+    result.className = 'test-result show';
+    result.textContent = 'Testing API...';
+    result.style.color = 'var(--text-muted)';
+    try {
+        const resp = await fetch('/api/settings/test-api', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                anthropic: {
+                    api_key: document.getElementById('settingsApiKey').value,
+                    model: document.getElementById('settingsModel').value,
+                },
+            }),
+        });
+        const data = await resp.json();
+        if (data.success) {
+            result.className = 'test-result show success';
+            result.textContent = `✓ API key valid, model ${data.model} is available`;
+        } else {
+            result.className = 'test-result show error';
+            result.textContent = `✗ ${data.error}`;
+        }
+    } catch(e) {
+        result.className = 'test-result show error';
+        result.textContent = `✗ ${e.message}`;
+    }
+}
+
+function gatherDbSettings() {
+    return {
+        host: document.getElementById('settingsDbHost').value.trim(),
+        port: parseInt(document.getElementById('settingsDbPort').value) || 5432,
+        dbname: document.getElementById('settingsDbName').value.trim(),
+        user: document.getElementById('settingsDbUser').value.trim(),
+        password: document.getElementById('settingsDbPassword').value,
+        schema: document.getElementById('settingsDbSchema').value.trim(),
+        reference_schema: document.getElementById('settingsDbRefSchema').value.trim(),
+        sslmode: document.getElementById('settingsDbSslMode').value,
+    };
+}
+
+async function saveSettings() {
+    const status = document.getElementById('saveStatus');
+    status.textContent = 'Saving...';
+    status.style.color = 'var(--text-muted)';
+    try {
+        const resp = await fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                database: gatherDbSettings(),
+                anthropic: {
+                    api_key: document.getElementById('settingsApiKey').value,
+                    model: document.getElementById('settingsModel').value,
+                },
+                app: {
+                    max_rows: parseInt(document.getElementById('settingsMaxRows').value) || 500,
+                    conversation_limit: parseInt(document.getElementById('settingsConvLimit').value) || 20,
+                },
+            }),
+        });
+        const data = await resp.json();
+        if (data.success) {
+            status.textContent = '✓ Saved';
+            status.style.color = 'var(--green)';
+            checkHealth();
+            setTimeout(() => closeSettings(), 800);
+        } else {
+            status.textContent = `✗ ${data.error || 'Save failed'}`;
+            status.style.color = 'var(--red)';
+        }
+    } catch(e) {
+        status.textContent = `✗ ${e.message}`;
+        status.style.color = 'var(--red)';
+    }
+}
+
+// Wire up model change
+document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('settingsModel')?.addEventListener('change', updateModelDesc);
+});
 
 loadSuggestions();
 loadConversations();

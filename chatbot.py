@@ -43,6 +43,11 @@ def load_config():
             "api_key": "",
             "model": "claude-sonnet-4-6",
         },
+        "models": [
+            {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "description": "Most capable, slower, higher cost"},
+            {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "description": "Balanced — recommended default"},
+            {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5", "description": "Fastest and cheapest"},
+        ],
         "app": {
             "port": 5100,
             "max_rows": 500,
@@ -55,13 +60,19 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 CONFIG = load_config()
+
+# Don't prompt for password if running in production — use Settings UI instead
 if not CONFIG.get("database", {}).get("password"):
-    CONFIG["database"]["password"] = os.environ.get("EDGAR_DB_PASSWORD", "") or getpass.getpass("DB password: ")
-    save_config(CONFIG)
+    env_pw = os.environ.get("EDGAR_DB_PASSWORD", "")
+    if env_pw:
+        CONFIG["database"]["password"] = env_pw
+        save_config(CONFIG)
 
 
 def get_conn():
     db = CONFIG["database"]
+    if not db.get("password"):
+        raise RuntimeError("Database password not configured. Open Settings to configure.")
     return psycopg2.connect(
         host=db["host"], port=db["port"],
         dbname=db["dbname"], user=db["user"],
@@ -515,6 +526,141 @@ def api_suggestions():
     })
 
 
+@app.route("/api/settings", methods=["GET"])
+def api_settings_get():
+    """Return current settings (password masked)."""
+    cfg = load_config()
+    db = dict(cfg.get("database", {}))
+    # Mask password — show whether it's set, not its value
+    db["password"] = "••••••••" if db.get("password") else ""
+    anthropic = dict(cfg.get("anthropic", {}))
+    anthropic["api_key"] = "••••••••" if anthropic.get("api_key") else ""
+    return jsonify({
+        "database": db,
+        "anthropic": anthropic,
+        "app": cfg.get("app", {}),
+        "models": cfg.get("models", [
+            {"id": "claude-opus-4-6", "name": "Claude Opus 4.6"},
+            {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6"},
+            {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5"},
+        ]),
+    })
+
+
+@app.route("/api/settings", methods=["POST"])
+def api_settings_post():
+    """Update settings. Empty/masked values are preserved from existing config."""
+    global CONFIG
+    data = request.get_json() or {}
+    cfg = load_config()
+
+    # Database
+    if "database" in data:
+        db_in = data["database"]
+        db_cur = cfg.setdefault("database", {})
+        for key in ("host", "port", "dbname", "user", "schema", "reference_schema", "sslmode"):
+            if key in db_in and db_in[key] != "":
+                db_cur[key] = db_in[key] if key != "port" else int(db_in[key] or 16149)
+        # Password: only update if non-masked value provided
+        if "password" in db_in:
+            pw = db_in["password"]
+            if pw and pw != "••••••••":
+                db_cur["password"] = pw
+
+    # Anthropic
+    if "anthropic" in data:
+        a_in = data["anthropic"]
+        a_cur = cfg.setdefault("anthropic", {})
+        if "model" in a_in and a_in["model"]:
+            a_cur["model"] = a_in["model"]
+        if "api_key" in a_in:
+            key = a_in["api_key"]
+            if key and key != "••••••••":
+                a_cur["api_key"] = key
+
+    # App settings
+    if "app" in data:
+        app_in = data["app"]
+        app_cur = cfg.setdefault("app", {})
+        if "max_rows" in app_in:
+            app_cur["max_rows"] = int(app_in["max_rows"] or 500)
+        if "conversation_limit" in app_in:
+            app_cur["conversation_limit"] = int(app_in["conversation_limit"] or 20)
+
+    # Models list — allow adding/removing/editing available models
+    if "models" in data and isinstance(data["models"], list):
+        cfg["models"] = data["models"]
+
+    save_config(cfg)
+    CONFIG = cfg  # reload in-memory copy
+    return jsonify({"success": True})
+
+
+@app.route("/api/settings/test-db", methods=["POST"])
+def api_settings_test_db():
+    """Test database connection with optionally-overridden credentials."""
+    data = request.get_json() or {}
+    try:
+        db = data.get("database") or CONFIG["database"]
+        # If password is masked, use the stored one
+        pw = db.get("password", "")
+        if pw == "••••••••" or not pw:
+            pw = CONFIG["database"].get("password", "")
+        conn = psycopg2.connect(
+            host=db["host"], port=int(db.get("port", 16149)),
+            dbname=db["dbname"], user=db["user"],
+            password=pw, sslmode=db.get("sslmode", "require"),
+            connect_timeout=10,
+        )
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_database(), current_user, version()")
+            db_name, db_user, version = cur.fetchone()
+        conn.close()
+        return jsonify({
+            "success": True,
+            "database": db_name,
+            "user": db_user,
+            "version": version.split(",")[0],
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/api/settings/test-api", methods=["POST"])
+def api_settings_test_api():
+    """Test the Anthropic API key."""
+    data = request.get_json() or {}
+    try:
+        anthropic = data.get("anthropic") or {}
+        api_key = anthropic.get("api_key", "")
+        if api_key == "••••••••" or not api_key:
+            api_key = CONFIG["anthropic"].get("api_key", "")
+        if not api_key:
+            return jsonify({"success": False, "error": "No API key configured"}), 400
+
+        model = anthropic.get("model") or CONFIG["anthropic"].get("model", "claude-sonnet-4-6")
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "max_tokens": 20,
+            "messages": [{"role": "user", "content": "Reply with just 'ok'"}],
+        }
+        resp = requests.post("https://api.anthropic.com/v1/messages",
+                             json=payload, headers=headers, timeout=20)
+        if resp.status_code == 200:
+            return jsonify({"success": True, "model": model})
+        else:
+            err_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            msg = err_data.get("error", {}).get("message", resp.text[:200])
+            return jsonify({"success": False, "error": f"HTTP {resp.status_code}: {msg}"}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
 @app.route("/api/health")
 def api_health():
     try:
@@ -528,6 +674,7 @@ def api_health():
         "status": "ok",
         "db": "connected" if db_ok else "disconnected",
         "has_api_key": bool(CONFIG["anthropic"].get("api_key")),
+        "current_model": CONFIG["anthropic"].get("model", ""),
     })
 
 
