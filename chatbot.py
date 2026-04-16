@@ -181,14 +181,21 @@ def introspect_schema():
         lines.append("")
 
     lines.append("# QUERY GUIDELINES")
-    lines.append("1. ALWAYS use the exact schema and table names shown above, with double quotes.")
-    lines.append("2. Filter by CIK when searching for a specific company — CIKs are usually stored without leading zeros.")
-    lines.append("3. LIMIT all queries to 500 rows maximum.")
-    lines.append("4. Join via PortfolioID or ShareClassID, not on CIK alone.")
-    lines.append("5. Dates are DATE type. Use 'YYYY-MM-DD' literals.")
-    lines.append('6. For "most recent", use ORDER BY <date_col> DESC LIMIT 1.')
-    lines.append("7. Return ONLY the SQL query — no explanation, no markdown, no backticks.")
-    lines.append("8. If a table name or column name contains mixed case, you MUST double-quote it.")
+    lines.append("1. ALWAYS use the EXACT schema-qualified table names shown above, with double quotes.")
+    lines.append('   CORRECT:   FROM "{}"."TableName"'.format(pe_schema))
+    lines.append('   WRONG:     FROM "TableName"       (no schema)')
+    lines.append('   WRONG:     FROM TableName          (no quotes)')
+    lines.append('   WRONG:     FROM tablename          (lowercase — not a real table)')
+    lines.append("2. Every table referenced MUST appear in the list above. Do NOT invent table names.")
+    lines.append("3. If the user asks about a concept and no matching table exists, respond that the data isn't available")
+    lines.append("   rather than guessing at a table name.")
+    lines.append("4. Filter by CIK when searching for a specific company — CIKs are usually stored without leading zeros.")
+    lines.append("5. LIMIT all queries to 500 rows maximum.")
+    lines.append("6. Join via PortfolioID or ShareClassID, not on CIK alone.")
+    lines.append("7. Dates are DATE type. Use 'YYYY-MM-DD' literals.")
+    lines.append('8. For "most recent", use ORDER BY <date_col> DESC LIMIT 1.')
+    lines.append("9. Return ONLY the SQL query — no explanation, no markdown, no backticks.")
+    lines.append("10. If a table name or column name contains mixed case, you MUST double-quote it.")
 
     return "\n".join(lines)
 
@@ -245,13 +252,103 @@ def call_claude(messages, system=None, max_tokens=4096):
     return text.strip(), data.get("usage", {})
 
 
+_KNOWN_TABLES_CACHE = {"tables": None, "updated": None}
+
+
+def get_known_tables():
+    """Return set of (schema, table) tuples that actually exist in the configured schemas."""
+    if _KNOWN_TABLES_CACHE["tables"] is not None:
+        return _KNOWN_TABLES_CACHE["tables"]
+    pe_schema = CONFIG["database"].get("schema", "")
+    ref_schema = CONFIG["database"].get("reference_schema", "")
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_schema, table_name FROM information_schema.tables
+                WHERE table_schema IN (%s, %s)
+            """, (pe_schema, ref_schema))
+            result = set()
+            for s, t in cur.fetchall():
+                result.add((s.lower(), t.lower()))
+            _KNOWN_TABLES_CACHE["tables"] = result
+            return result
+    finally:
+        conn.close()
+
+
+def validate_sql_tables(sql):
+    """Check that every FROM/JOIN references a known table. Returns error message or None."""
+    try:
+        known = get_known_tables()
+    except Exception:
+        return None  # can't validate, let the query run and fail naturally
+
+    if not known:
+        return "No tables found in configured schemas — open Settings → Diagnose"
+
+    # Extract all FROM/JOIN table references
+    # Matches: FROM/JOIN "schema"."table" or FROM/JOIN schema.table or FROM/JOIN table
+    pattern = re.compile(
+        r'\b(?:FROM|JOIN)\s+'
+        r'(?:"([^"]+)"\.)?'       # optional schema (quoted)
+        r'(?:([a-zA-Z_][a-zA-Z0-9_]*)\.)?'  # or unquoted schema
+        r'(?:"([^"]+)"|([a-zA-Z_][a-zA-Z0-9_]*))',  # table name (quoted or bare)
+        re.IGNORECASE
+    )
+    refs = []
+    for m in pattern.finditer(sql):
+        quoted_schema, bare_schema, quoted_table, bare_table = m.groups()
+        schema = (quoted_schema or bare_schema or "").lower()
+        table = (quoted_table or bare_table or "").lower()
+        if not table:
+            continue
+        # Skip obvious subquery aliases and information_schema
+        if table in ('information_schema', 'pg_catalog'):
+            continue
+        refs.append((schema, table))
+
+    # Check each reference
+    pe_schema = CONFIG["database"].get("schema", "").lower()
+    ref_schema = CONFIG["database"].get("reference_schema", "").lower()
+
+    for schema, table in refs:
+        if not schema:
+            # Unqualified table — check if it exists in either configured schema
+            found = any(s in (pe_schema, ref_schema) and t == table for s, t in known)
+            if not found:
+                return (
+                    f"Query references unqualified table '{table}' which doesn't exist "
+                    f"in schema '{pe_schema}' or '{ref_schema}'."
+                )
+        else:
+            if (schema, table) not in known:
+                return (
+                    f"Query references table \"{schema}\".\"{table}\" which doesn't exist."
+                )
+    return None
+
+
 def nl_to_sql(question, conversation_history=None):
     """Translate a natural language question into SQL using Claude."""
     history = conversation_history or []
 
-    # Build messages including prior turns
+    # Get schema context FIRST. Fail loudly if empty.
+    schema_ctx = get_schema_context()
+    if not schema_ctx or "WARNING: No tables found" in schema_ctx:
+        raise RuntimeError(
+            f"Schema context is empty or missing. "
+            f"Open Settings → Diagnose to see what schemas exist in your DB, "
+            f"then update the PE Schema field to match and click Refresh Schema."
+        )
+    print(f"[nl_to_sql] schema context: {len(schema_ctx):,} chars")
+
+    # Build messages including prior turns — but ONLY include turns whose SQL
+    # didn't error out. Including bad SQL in history teaches the LLM to repeat it.
     messages = []
-    for turn in history[-10:]:  # last 10 turns for context
+    for turn in history[-10:]:
+        if turn.get("error"):
+            continue  # skip failed turns — they'd poison the context
         if turn.get("user"):
             messages.append({"role": "user", "content": turn["user"]})
         if turn.get("assistant_sql"):
@@ -259,17 +356,50 @@ def nl_to_sql(question, conversation_history=None):
 
     messages.append({
         "role": "user",
-        "content": f"Generate a PostgreSQL query to answer this question: {question}\n\nReturn ONLY the SQL query. Start with SELECT. No backticks, no explanation."
+        "content": (
+            f"Generate a PostgreSQL query to answer this question: {question}\n\n"
+            f"Return ONLY the SQL query. Start with SELECT. No backticks, no explanation. "
+            f"Remember: every table MUST be referenced with its exact schema name from the list, "
+            f"fully double-quoted. NEVER use bare table names like 'extractions' or 'filings'."
+        )
     })
 
-    sql, usage = call_claude(messages, system=get_schema_context())
+    total_usage = {"input_tokens": 0, "output_tokens": 0}
+    sql = ""
 
-    # Clean up the SQL
-    sql = re.sub(r"^```(?:sql)?\s*", "", sql)
-    sql = re.sub(r"\s*```$", "", sql)
-    sql = sql.strip()
+    # Try up to 2 times — if first query references unknown tables, retry with explicit guidance
+    for attempt in range(2):
+        sql, usage = call_claude(messages, system=schema_ctx)
+        total_usage["input_tokens"] += usage.get("input_tokens", 0)
+        total_usage["output_tokens"] += usage.get("output_tokens", 0)
 
-    return sql, usage
+        # Clean up
+        sql = re.sub(r"^```(?:sql)?\s*", "", sql)
+        sql = re.sub(r"\s*```$", "", sql)
+        sql = sql.strip()
+
+        # Validate table references
+        error = validate_sql_tables(sql)
+        if not error:
+            break  # query looks good
+
+        if attempt == 0:
+            # Inject the error as a correction message and retry
+            print(f"[nl_to_sql] Validation failed (attempt 1): {error}")
+            messages.append({"role": "assistant", "content": sql})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"That query references tables that don't exist in this database. Error: {error}\n\n"
+                    f"Re-read the table list in the system prompt and generate a new query using "
+                    f"ONLY tables that appear there, fully schema-qualified with double quotes. "
+                    f"If no matching table exists, pick the closest match or say no data is available."
+                )
+            })
+        else:
+            print(f"[nl_to_sql] Validation failed (attempt 2): {error} — returning anyway")
+
+    return sql, total_usage
 
 
 def summarize_results(question, sql, rows, columns):
@@ -617,6 +747,7 @@ def api_settings_post():
     # Invalidate schema cache so next query re-introspects with new DB settings
     _SCHEMA_CACHE["context"] = None
     _SCHEMA_CACHE["updated"] = None
+    _KNOWN_TABLES_CACHE["tables"] = None
     return jsonify({"success": True})
 
 
@@ -624,6 +755,7 @@ def api_settings_post():
 def api_schema_refresh():
     """Force a refresh of the schema context from the database."""
     try:
+        _KNOWN_TABLES_CACHE["tables"] = None  # invalidate known tables cache too
         ctx = get_schema_context(force_refresh=True)
         return jsonify({
             "success": True,
@@ -643,6 +775,51 @@ def api_schema_get():
         "updated": _SCHEMA_CACHE["updated"],
         "chars": len(_SCHEMA_CACHE["context"] or ""),
     })
+
+
+@app.route("/api/schema/diagnose")
+def api_schema_diagnose():
+    """List ALL schemas and tables so the user can see what's actually in the DB."""
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                # All schemas
+                cur.execute("""
+                    SELECT schema_name FROM information_schema.schemata
+                    WHERE schema_name NOT IN ('pg_catalog','information_schema','pg_toast','pg_temp_1','pg_toast_temp_1')
+                    ORDER BY schema_name
+                """)
+                schemas = [r[0] for r in cur.fetchall()]
+
+                # Tables per schema
+                cur.execute("""
+                    SELECT table_schema, table_name
+                    FROM information_schema.tables
+                    WHERE table_schema NOT IN ('pg_catalog','information_schema')
+                    ORDER BY table_schema, table_name
+                """)
+                tables_by_schema = {}
+                for schema, table in cur.fetchall():
+                    tables_by_schema.setdefault(schema, []).append(table)
+
+                # What the configured schemas have
+                pe_schema = CONFIG["database"].get("schema", "")
+                ref_schema = CONFIG["database"].get("reference_schema", "")
+
+            return jsonify({
+                "all_schemas": schemas,
+                "configured_pe_schema": pe_schema,
+                "configured_ref_schema": ref_schema,
+                "pe_schema_exists": pe_schema in schemas,
+                "ref_schema_exists": ref_schema in schemas,
+                "tables_by_schema": tables_by_schema,
+                "table_counts": {s: len(t) for s, t in tables_by_schema.items()},
+            })
+        finally:
+            conn.close()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/settings/test-db", methods=["POST"])

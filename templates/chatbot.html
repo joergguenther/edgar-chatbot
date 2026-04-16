@@ -542,6 +542,7 @@
                 <div style="margin-top: 0.5rem; margin-left: 130px">
                     <button class="btn btn-test" onclick="testDb()">Test Connection</button>
                     <button class="btn btn-test" onclick="refreshSchema()" title="Re-read tables and columns from the database">🔄 Refresh Schema</button>
+                    <button class="btn btn-test" onclick="diagnoseSchema()" title="Show all schemas and tables in the database">🔍 Diagnose</button>
                     <div class="test-result" id="dbTestResult"></div>
                 </div>
             </div>
@@ -1256,6 +1257,64 @@ async function refreshSchema() {
             result.className = 'test-result show error';
             result.textContent = `✗ ${data.error}`;
         }
+    } catch(e) {
+        result.className = 'test-result show error';
+        result.textContent = `✗ ${e.message}`;
+    }
+}
+
+async function diagnoseSchema() {
+    const result = document.getElementById('dbTestResult');
+    result.className = 'test-result show';
+    result.textContent = 'Scanning database...';
+    result.style.color = 'var(--text-muted)';
+    try {
+        const resp = await fetch('/api/schema/diagnose');
+        const data = await resp.json();
+        if (data.error) {
+            result.className = 'test-result show error';
+            result.textContent = `✗ ${data.error}`;
+            return;
+        }
+        let html = '<div style="font-size:0.75rem; line-height:1.5">';
+        html += `<strong>All schemas:</strong> ${data.all_schemas.join(', ') || '(none)'}<br>`;
+        html += `<strong>Configured PE schema:</strong> <code>${escapeHtml(data.configured_pe_schema)}</code> — `;
+        html += data.pe_schema_exists
+            ? `<span style="color:var(--green)">✓ exists (${data.table_counts[data.configured_pe_schema] || 0} tables)</span>`
+            : `<span style="color:var(--red)">✗ NOT FOUND</span>`;
+        html += '<br>';
+        html += `<strong>Configured ref schema:</strong> <code>${escapeHtml(data.configured_ref_schema)}</code> — `;
+        html += data.ref_schema_exists
+            ? `<span style="color:var(--green)">✓ exists (${data.table_counts[data.configured_ref_schema] || 0} tables)</span>`
+            : `<span style="color:var(--red)">✗ NOT FOUND</span>`;
+        html += '<br><br>';
+
+        // Table counts
+        html += '<strong>Tables per schema:</strong><br>';
+        for (const [schema, count] of Object.entries(data.table_counts)) {
+            html += `&nbsp;&nbsp;<code>${escapeHtml(schema)}</code>: ${count}<br>`;
+        }
+
+        // Offer suggestions if configured schema doesn't exist
+        if (!data.pe_schema_exists) {
+            html += '<br><strong style="color:var(--amber)">⚠ Fix:</strong> ';
+            // Find likely candidates
+            const candidates = Object.entries(data.table_counts)
+                .filter(([s, c]) => c >= 3)
+                .sort((a, b) => b[1] - a[1]);
+            if (candidates.length) {
+                html += `Update the PE Schema field to one of: ${candidates.map(([s]) => `<code>${escapeHtml(s)}</code>`).join(', ')}`;
+            } else {
+                html += 'No schemas with tables found. Run the DDL scripts first.';
+            }
+        }
+
+        html += '</div>';
+        result.className = 'test-result show';
+        result.style.color = 'var(--text)';
+        result.style.background = 'var(--bg)';
+        result.style.border = '1px solid var(--border)';
+        result.innerHTML = html;
     } catch(e) {
         result.className = 'test-result show error';
         result.textContent = `✗ ${e.message}`;
