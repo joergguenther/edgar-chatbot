@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <title>EDGAR Data Chatbot</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
     :root {
         --bg: #0f1419;
@@ -226,6 +227,55 @@
         white-space: nowrap;
     }
     .data-table tr:hover td { background: var(--bg-hover); }
+
+    /* Chart panel */
+    .chart-panel {
+        margin-top: 0.5rem; padding: 0.9rem;
+        border: 1px solid var(--border); border-radius: 6px;
+        background: var(--bg-elev); display: none;
+    }
+    .chart-panel.show { display: block; }
+    .chart-controls {
+        display: flex; gap: 0.6rem; flex-wrap: wrap;
+        margin-bottom: 0.8rem; align-items: center;
+    }
+    .chart-control-group {
+        display: flex; align-items: center; gap: 0.35rem;
+    }
+    .chart-control-group label {
+        font-size: 0.72rem; color: var(--text-muted);
+        font-weight: 600;
+    }
+    .chart-control-group select {
+        background: var(--bg); border: 1px solid var(--border);
+        color: var(--text); padding: 0.3rem 0.5rem;
+        border-radius: 5px; font-size: 0.78rem;
+        font-family: inherit; cursor: pointer;
+        max-width: 180px;
+    }
+    .chart-type-btn {
+        background: var(--bg); border: 1px solid var(--border);
+        color: var(--text-muted); padding: 0.3rem 0.6rem;
+        border-radius: 5px; cursor: pointer; font-size: 0.78rem;
+        font-family: inherit; transition: all 0.15s;
+    }
+    .chart-type-btn:hover {
+        background: var(--bg-hover); color: var(--text);
+    }
+    .chart-type-btn.active {
+        background: var(--accent); color: white;
+        border-color: var(--accent);
+    }
+    .chart-canvas-wrapper {
+        position: relative; height: 340px; width: 100%;
+        background: var(--bg); padding: 0.5rem;
+        border-radius: 5px; border: 1px solid var(--border);
+    }
+    .chart-empty {
+        display: flex; align-items: center; justify-content: center;
+        height: 100%; color: var(--text-muted); font-size: 0.85rem;
+        text-align: center; padding: 2rem;
+    }
 
     .input-wrapper {
         padding: 1rem 2rem 1.5rem; border-top: 1px solid var(--border);
@@ -734,8 +784,10 @@ function renderTurn(turn) {
     const hasRows = turn.rows_preview && turn.rows_preview.length > 0;
     const tableId = 'table_' + Math.random().toString(36).slice(2);
     const sqlId = 'sql_' + Math.random().toString(36).slice(2);
+    const chartId = 'chart_' + Math.random().toString(36).slice(2);
 
     let tableHtml = '';
+    let chartHtml = '';
     if (hasRows) {
         const cols = turn.columns || Object.keys(turn.rows_preview[0] || {});
         tableHtml = `<div class="data-table-wrapper" id="${tableId}">
@@ -746,6 +798,47 @@ function renderTurn(turn) {
                 ).join('')}</tbody>
             </table>
         </div>`;
+
+        // Auto-detect reasonable default axis columns
+        const { labelCol, valueCol } = detectChartAxes(turn.rows_preview, cols);
+
+        chartHtml = `<div class="chart-panel" id="${chartId}" data-rendered="false">
+            <div class="chart-controls">
+                <div class="chart-control-group">
+                    <label>Type:</label>
+                    <button class="chart-type-btn active" data-type="bar" onclick="setChartType('${chartId}', 'bar', this)">📊 Bar</button>
+                    <button class="chart-type-btn" data-type="line" onclick="setChartType('${chartId}', 'line', this)">📈 Line</button>
+                    <button class="chart-type-btn" data-type="pie" onclick="setChartType('${chartId}', 'pie', this)">🥧 Pie</button>
+                    <button class="chart-type-btn" data-type="doughnut" onclick="setChartType('${chartId}', 'doughnut', this)">🍩 Doughnut</button>
+                    <button class="chart-type-btn" data-type="horizontalBar" onclick="setChartType('${chartId}', 'horizontalBar', this)">📉 H-Bar</button>
+                </div>
+                <div class="chart-control-group">
+                    <label>X:</label>
+                    <select onchange="updateChartAxis('${chartId}', 'x', this.value)">
+                        ${cols.map(c => `<option value="${escapeHtml(c)}"${c === labelCol ? ' selected' : ''}>${escapeHtml(c)}</option>`).join('')}
+                    </select>
+                </div>
+                <div class="chart-control-group">
+                    <label>Y:</label>
+                    <select onchange="updateChartAxis('${chartId}', 'y', this.value)">
+                        ${cols.map(c => `<option value="${escapeHtml(c)}"${c === valueCol ? ' selected' : ''}>${escapeHtml(c)}</option>`).join('')}
+                    </select>
+                </div>
+            </div>
+            <div class="chart-canvas-wrapper">
+                <canvas></canvas>
+            </div>
+        </div>`;
+
+        // Store rows on the panel element after render
+        window._chartDataCache = window._chartDataCache || {};
+        window._chartDataCache[chartId] = {
+            rows: turn.rows_preview,
+            columns: cols,
+            type: 'bar',
+            xCol: labelCol,
+            yCol: valueCol,
+        };
     }
 
     // Cost pill
@@ -764,12 +857,184 @@ function renderTurn(turn) {
                 ${turn.row_count ? `<span>${turn.row_count} row${turn.row_count !== 1 ? 's' : ''}</span>` : ''}
                 ${costStr ? `<span class="cost-pill" title="${escapeHtml(tokensTitle)}">💰 ${costStr}</span>` : ''}
                 <button class="sql-toggle" onclick="toggleEl('${sqlId}')">📝 SQL</button>
-                ${hasRows ? `<button class="sql-toggle" onclick="toggleEl('${tableId}')">📊 Data</button>` : ''}
+                ${hasRows ? `<button class="sql-toggle" onclick="toggleEl('${tableId}')">📋 Table</button>` : ''}
+                ${hasRows ? `<button class="sql-toggle" onclick="toggleChart('${chartId}')">📈 Chart</button>` : ''}
             </div>
             <div class="sql-panel" id="${sqlId}">${escapeHtml(turn.assistant_sql || '')}</div>
             ${tableHtml}
+            ${chartHtml}
         </div>
     `;
+}
+
+// ── CHART RENDERING ────────────────────────────────────────────────
+
+function detectChartAxes(rows, cols) {
+    // Find first non-numeric column for X (labels)
+    // Find first numeric column for Y (values)
+    let labelCol = cols[0];
+    let valueCol = cols[cols.length - 1];
+    if (!rows.length) return { labelCol, valueCol };
+    const sample = rows[0];
+    for (const c of cols) {
+        const v = sample[c];
+        if (v === null || v === undefined) continue;
+        const asNum = parseFloat(v);
+        const isNumeric = !isNaN(asNum) && isFinite(asNum) && String(v).trim() !== '';
+        if (!isNumeric && labelCol === cols[0]) {
+            labelCol = c;
+        }
+        if (isNumeric && valueCol === cols[cols.length - 1]) {
+            valueCol = c;
+        }
+    }
+    // If label and value landed on the same column, pick different defaults
+    if (labelCol === valueCol && cols.length > 1) {
+        for (const c of cols) {
+            if (c !== labelCol) {
+                const asNum = parseFloat(sample[c]);
+                if (!isNaN(asNum) && isFinite(asNum)) {
+                    valueCol = c;
+                    break;
+                }
+            }
+        }
+    }
+    return { labelCol, valueCol };
+}
+
+function toggleChart(chartId) {
+    const panel = document.getElementById(chartId);
+    if (!panel) return;
+    const isHidden = !panel.classList.contains('show');
+    panel.classList.toggle('show');
+    if (isHidden && panel.dataset.rendered !== 'true') {
+        renderChart(chartId);
+        panel.dataset.rendered = 'true';
+    }
+}
+
+function setChartType(chartId, type, btn) {
+    const cfg = window._chartDataCache?.[chartId];
+    if (!cfg) return;
+    cfg.type = type;
+    // Update active state
+    const btns = btn.parentElement.querySelectorAll('.chart-type-btn');
+    btns.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    renderChart(chartId);
+}
+
+function updateChartAxis(chartId, axis, col) {
+    const cfg = window._chartDataCache?.[chartId];
+    if (!cfg) return;
+    if (axis === 'x') cfg.xCol = col;
+    if (axis === 'y') cfg.yCol = col;
+    renderChart(chartId);
+}
+
+function renderChart(chartId) {
+    const cfg = window._chartDataCache?.[chartId];
+    if (!cfg) return;
+    const panel = document.getElementById(chartId);
+    const canvas = panel.querySelector('canvas');
+    if (!canvas) return;
+
+    // Destroy previous chart on this canvas
+    if (canvas._chart) {
+        canvas._chart.destroy();
+        canvas._chart = null;
+    }
+
+    const rows = cfg.rows || [];
+    const { xCol, yCol, type } = cfg;
+
+    if (!rows.length) {
+        canvas.parentElement.innerHTML = '<div class="chart-empty">No data to chart</div>';
+        return;
+    }
+
+    // Build labels and data
+    const labels = rows.map(r => String(r[xCol] ?? ''));
+    const values = rows.map(r => {
+        const v = r[yCol];
+        const n = parseFloat(v);
+        return isNaN(n) ? 0 : n;
+    });
+
+    // Check if Y column has any numeric values
+    const hasNumeric = values.some(v => v !== 0) || rows.some(r => {
+        const v = r[yCol];
+        return v !== null && v !== undefined && !isNaN(parseFloat(v));
+    });
+    if (!hasNumeric) {
+        canvas.parentElement.innerHTML = `<div class="chart-empty">Column "${escapeHtml(yCol)}" has no numeric values. Pick a different Y-axis column.</div>`;
+        return;
+    }
+
+    // Theme-aware colors
+    const isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+    const textColor = isDark ? '#e6e6e6' : '#171717';
+    const gridColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)';
+    const palette = [
+        '#6366f1', '#10b981', '#f59e0b', '#ef4444', '#06b6d4',
+        '#8b5cf6', '#ec4899', '#84cc16', '#f97316', '#14b8a6',
+    ];
+
+    // Horizontal bar is just bar with indexAxis: 'y' in Chart.js v4
+    const actualType = type === 'horizontalBar' ? 'bar' : type;
+    const isPieLike = (type === 'pie' || type === 'doughnut');
+
+    const datasetConfig = {
+        label: yCol,
+        data: values,
+        backgroundColor: isPieLike
+            ? labels.map((_, i) => palette[i % palette.length])
+            : 'rgba(99, 102, 241, 0.7)',
+        borderColor: isPieLike
+            ? labels.map((_, i) => palette[i % palette.length])
+            : '#6366f1',
+        borderWidth: isPieLike ? 2 : 1,
+        tension: type === 'line' ? 0.3 : 0,
+        fill: type === 'line' ? false : true,
+    };
+
+    const options = {
+        responsive: true,
+        maintainAspectRatio: false,
+        indexAxis: type === 'horizontalBar' ? 'y' : 'x',
+        plugins: {
+            legend: {
+                display: isPieLike,
+                position: 'right',
+                labels: { color: textColor, font: { size: 11 } },
+            },
+            tooltip: {
+                backgroundColor: isDark ? 'rgba(26,31,42,0.95)' : 'rgba(255,255,255,0.95)',
+                titleColor: textColor,
+                bodyColor: textColor,
+                borderColor: gridColor,
+                borderWidth: 1,
+            },
+        },
+        scales: isPieLike ? {} : {
+            x: {
+                ticks: { color: textColor, font: { size: 10 }, maxRotation: 45, minRotation: 0 },
+                grid: { color: gridColor, drawOnChartArea: false },
+            },
+            y: {
+                ticks: { color: textColor, font: { size: 10 } },
+                grid: { color: gridColor },
+                beginAtZero: true,
+            },
+        },
+    };
+
+    canvas._chart = new Chart(canvas, {
+        type: actualType,
+        data: { labels, datasets: [datasetConfig] },
+        options,
+    });
 }
 
 function formatCost(usd) {
