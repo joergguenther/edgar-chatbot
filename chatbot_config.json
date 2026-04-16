@@ -1,0 +1,21 @@
+{
+  "database": {
+    "host": "a402389-akamai-prod-6092099-default.g2a.akamaidb.net",
+    "port": 16149,
+    "dbname": "defaultdb",
+    "user": "akmadmin",
+    "password": "",
+    "schema": "newdev_private_equity",
+    "reference_schema": "newdev_public_equity",
+    "sslmode": "require"
+  },
+  "anthropic": {
+    "api_key": "",
+    "model": "claude-sonnet-4-6"
+  },
+  "app": {
+    "port": 5100,
+    "max_rows": 500,
+    "conversation_limit": 20
+  }
+}
