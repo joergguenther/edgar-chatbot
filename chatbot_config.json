@@ -16,6 +16,7 @@
   "app": {
     "port": 5100,
     "max_rows": 500,
-    "conversation_limit": 20
+    "conversation_limit": 20,
+    "loader_url": "http://localhost:5070"
   }
 }

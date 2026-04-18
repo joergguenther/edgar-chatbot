@@ -563,6 +563,13 @@
                         <div class="field-help">Past conversation turns to include for follow-up context</div>
                     </div>
                 </div>
+                <div class="field-row">
+                    <label>EDGAR Loader URL</label>
+                    <div>
+                        <input type="text" id="settingsLoaderUrl" placeholder="http://localhost:5070" style="font-family:var(--mono);font-size:0.82rem">
+                        <div class="field-help">URL of the Peppercorn EDGAR Loader for triggering extractions</div>
+                    </div>
+                </div>
             </div>
 
         </div>
@@ -1220,6 +1227,7 @@ async function openSettings() {
         const ap = data.app || {};
         document.getElementById('settingsMaxRows').value = ap.max_rows || 500;
         document.getElementById('settingsConvLimit').value = ap.conversation_limit || 20;
+        document.getElementById('settingsLoaderUrl').value = ap.loader_url || 'http://localhost:5070';
     } catch(e) {
         console.error('Failed to load settings:', e);
     }
@@ -1442,6 +1450,7 @@ async function saveSettings() {
                 app: {
                     max_rows: parseInt(document.getElementById('settingsMaxRows').value) || 500,
                     conversation_limit: parseInt(document.getElementById('settingsConvLimit').value) || 20,
+                    loader_url: document.getElementById('settingsLoaderUrl').value || 'http://localhost:5070',
                 },
             }),
         });

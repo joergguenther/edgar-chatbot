@@ -55,6 +55,7 @@ def load_config():
             "port": 5100,
             "max_rows": 500,
             "conversation_limit": 20,  # how many past turns to keep
+            "loader_url": "http://localhost:5070",  # EDGAR Loader API for triggering extractions
         },
     }
 
@@ -341,7 +342,11 @@ def validate_sql_tables(sql):
 
 
 def nl_to_sql(question, conversation_history=None):
-    """Translate a natural language question into SQL using Claude."""
+    """Translate a natural language question into SQL — or detect extraction intent.
+    Returns (response_type, payload, usage) where:
+    - response_type='sql': payload is the SQL query string
+    - response_type='extract': payload is a dict with extraction parameters
+    """
     history = conversation_history or []
 
     # Get schema context FIRST. Fail loudly if empty or failed.
@@ -351,19 +356,77 @@ def nl_to_sql(question, conversation_history=None):
             f"Schema not loaded. {schema_ctx[:500] if schema_ctx else 'Empty context.'} "
             f"Open Settings → 🔍 Diagnose to see what's wrong."
         )
-    # Also check that we actually have tables in the context
     if schema_ctx.count("## \"") == 0:
         raise RuntimeError(
             "Schema context has no tables. Open Settings → 🔍 Diagnose to see what's in the database."
         )
     print(f"[nl_to_sql] schema context: {len(schema_ctx):,} chars, {schema_ctx.count('## \"')} tables")
 
-    # Build messages including prior turns — but ONLY include turns whose SQL
-    # didn't error out. Including bad SQL in history teaches the LLM to repeat it.
+    # Add extraction capability context
+    extraction_ctx = """
+
+# EXTRACTION CAPABILITY
+You can trigger new data extractions from SEC EDGAR filings. If the user asks to
+"extract", "fetch", "pull", "get new data", "load data from EDGAR", or similar action
+verbs that imply getting NEW data from filings (not querying existing data), respond with
+a JSON action instead of SQL.
+
+Format for extraction requests:
+ACTION:EXTRACT:{"cik": "0001920145", "domains": ["returns", "nav_pricing"], "period": "most_recent"}
+
+You can also specify company_name instead of CIK — the system will look it up:
+ACTION:EXTRACT:{"company_name": "Blue Owl", "domains": ["returns"], "period": "most_recent"}
+
+For time-specific extractions:
+ACTION:EXTRACT:{"cik": "0001920145", "domains": ["distributions"], "period": "quarter", "year": 2024, "quarter": 3}
+ACTION:EXTRACT:{"cik": "0001920145", "domains": ["returns", "fees"], "period": "annual", "year": 2024}
+
+Available domains and what they extract:
+- filing_master → Fund regulatory filing metadata
+- nav_pricing → NAV per share, offering/repurchase prices
+- shares_outstanding → Shares outstanding per class
+- volatility → Volatility & risk metrics
+- distributions → Distribution history per share class
+- dist_ytd/dist_drip/dist_metrics/dist_tax → YTD totals, DRIP, metrics, tax character
+- composition/comp_objectives → Portfolio composition by asset type, geography, industry
+- leverage/leverage_summary/leverage_covenant → Debt facilities, ratios, covenant compliance
+- returns → Total return, period performance, benchmark comparison
+- fees → Management fees, expense ratios
+- repurchase_fees/investor_eligibility → Share class eligibility, repurchase fees
+- offering_price → Offering/repurchase prices per class
+- redemptions/liquidation_program/share_conversion → Liquidity programs
+- death_disability/sc_liquidity → Death/disability provisions, share class liquidity
+- interval_detail/interval_next_dates/interval_gates/interval_suspension/interval_early_withdrawal → Interval fund specifics
+- tender_program/tender_suspension/tender_next_dates → Tender offer specifics
+- account_metrics → Account-level metrics
+- operational_details → Service providers, board details
+
+Period options: "most_recent" (default), "quarter" (needs year+quarter), "annual" (needs year)
+
+DECISION RULES:
+- "Show me NAV for CIK 1234" → SQL query (querying EXISTING data)
+- "Extract NAV for CIK 1234" → Extraction action (fetching NEW data from EDGAR)
+- "What's the latest distribution?" → SQL query
+- "Pull fresh distribution data from EDGAR for Blue Owl" → Extraction action
+- "Compare returns across all BDCs" → SQL query (analyzing existing data)
+- "Get returns data for CIK 1234 from the 2024 10-K" → Extraction action
+
+COMMON QUERY PATTERNS:
+- To find a company: JOIN with the reference portfolio table on "PortfolioID" which has "CompanyName" and "CIK"
+- NAV data: T_PE_FUND_SHARE_CLASS_NAV_PRICING has "NAVPS", "ReportDate"
+- Returns: T_PE_FUND_SHARE_CLASS_RETURNS has "Fund1Year", "FundYTD", "FundSinceInception"
+- Distributions: T_PE_FUND_SHARE_CLASS_DISTRIBUTION_HISTORY has "DistributionPerShare", "RecordDate"
+- Leverage: T_PE_FUND_LEVERAGE_DETAIL has facility-level debt; T_INST_PE_FUND_LEVERAGE_SUMMARY has totals
+- Extraction log: T_PE_FUND_EXTRACTION_LOG tracks all extractions with timestamps and costs
+
+For SQL queries: respond with ONLY the SQL query, starting with SELECT.
+For extraction actions: respond with ONLY the ACTION:EXTRACT:{json} line."""
+
+    # Build messages
     messages = []
     for turn in history[-10:]:
         if turn.get("error"):
-            continue  # skip failed turns — they'd poison the context
+            continue
         if turn.get("user"):
             messages.append({"role": "user", "content": turn["user"]})
         if turn.get("assistant_sql"):
@@ -372,49 +435,54 @@ def nl_to_sql(question, conversation_history=None):
     messages.append({
         "role": "user",
         "content": (
-            f"Generate a PostgreSQL query to answer this question: {question}\n\n"
-            f"Return ONLY the SQL query. Start with SELECT. No backticks, no explanation. "
-            f"Remember: every table MUST be referenced with its exact schema name from the list, "
-            f"fully double-quoted. NEVER use bare table names like 'extractions' or 'filings'."
+            f"Answer this request: {question}\n\n"
+            f"If this is a DATA QUERY (show, list, compare existing data): return ONLY a SELECT SQL query.\n"
+            f"If this is an EXTRACTION REQUEST (extract, fetch, pull new data from EDGAR): return ACTION:EXTRACT:{{json}}.\n"
+            f"Remember: every table MUST be referenced with its exact schema name, fully double-quoted."
         )
     })
 
     total_usage = {"input_tokens": 0, "output_tokens": 0}
-    sql = ""
+    response = ""
 
-    # Try up to 2 times — if first query references unknown tables, retry with explicit guidance
     for attempt in range(2):
-        sql, usage = call_claude(messages, system=schema_ctx)
+        response, usage = call_claude(messages, system=schema_ctx + extraction_ctx)
         total_usage["input_tokens"] += usage.get("input_tokens", 0)
         total_usage["output_tokens"] += usage.get("output_tokens", 0)
 
-        # Clean up
-        sql = re.sub(r"^```(?:sql)?\s*", "", sql)
+        # Check if this is an extraction action
+        if response.strip().startswith("ACTION:EXTRACT:"):
+            json_str = response.strip()[len("ACTION:EXTRACT:"):]
+            try:
+                extract_params = json.loads(json_str)
+                return "extract", extract_params, total_usage
+            except json.JSONDecodeError:
+                pass
+
+        # Otherwise treat as SQL
+        sql = re.sub(r"^```(?:sql)?\s*", "", response)
         sql = re.sub(r"\s*```$", "", sql)
         sql = sql.strip()
 
         # Validate table references
         error = validate_sql_tables(sql)
         if not error:
-            break  # query looks good
+            return "sql", sql, total_usage
 
         if attempt == 0:
-            # Inject the error as a correction message and retry
             print(f"[nl_to_sql] Validation failed (attempt 1): {error}")
             messages.append({"role": "assistant", "content": sql})
             messages.append({
                 "role": "user",
                 "content": (
-                    f"That query references tables that don't exist in this database. Error: {error}\n\n"
-                    f"Re-read the table list in the system prompt and generate a new query using "
-                    f"ONLY tables that appear there, fully schema-qualified with double quotes. "
-                    f"If no matching table exists, pick the closest match or say no data is available."
+                    f"That query references tables that don't exist. Error: {error}\n\n"
+                    f"Re-read the table list and generate a new query using ONLY tables that appear there."
                 )
             })
         else:
             print(f"[nl_to_sql] Validation failed (attempt 2): {error} — returning anyway")
 
-    return sql, total_usage
+    return "sql", sql, total_usage
 
 
 def summarize_results(question, sql, rows, columns):
@@ -524,6 +592,141 @@ def index():
     return render_template("chatbot.html")
 
 
+def _trigger_extraction(params):
+    """Call the EDGAR Loader API to trigger a new extraction.
+    params: {"cik": "...", "domains": [...], "period": "most_recent", "year": 2024, "quarter": 1}
+    Also supports {"company_name": "Blue Owl", ...} — will look up CIK first.
+    """
+    loader_url = CONFIG.get("app", {}).get("loader_url", "http://localhost:5070")
+    cik = params.get("cik", "").strip()
+    company_name = params.get("company_name", "").strip()
+    domains = params.get("domains", [])
+    period = params.get("period", "most_recent")
+
+    # If company_name provided but no CIK, look it up from the DB first
+    if not cik and company_name:
+        try:
+            conn = get_conn()
+            ref_schema = CONFIG["database"].get("reference_schema", "newdev_public_equity")
+            with conn.cursor() as cur:
+                cur.execute(f'''
+                    SELECT "CIK", "CompanyName" FROM "{ref_schema}"."T_PORT_PORTFOLIO"
+                    WHERE "CompanyName" ILIKE %s
+                    ORDER BY "PortfolioID" LIMIT 5
+                ''', (f'%{company_name}%',))
+                matches = cur.fetchall()
+            conn.close()
+
+            if matches:
+                if len(matches) == 1:
+                    cik = str(matches[0][0])
+                    company_name = matches[0][1]
+                    print(f"  [extract] Resolved company '{company_name}' → CIK {cik}")
+                else:
+                    match_list = ", ".join(f"{m[1]} (CIK {m[0]})" for m in matches[:5])
+                    return {"answer": f"Multiple matches found for '{company_name}': {match_list}. Please specify the CIK number."}
+            else:
+                return {"answer": f"No portfolio found matching '{company_name}' in the database. Please provide the CIK number directly."}
+        except Exception as e:
+            return {"answer": f"Could not look up company name: {e}. Please provide the CIK number directly."}
+
+    if not cik:
+        return {"error": "No CIK provided for extraction", "answer": "I need a CIK number or company name to trigger an extraction."}
+
+    if not domains:
+        return {"error": "No domains specified", "answer": "Please specify which domains to extract (e.g., returns, nav_pricing, distributions)."}
+
+    try:
+        # Step 1: Search EDGAR for the company
+        search_resp = requests.get(f"{loader_url}/api/edgar/search",
+                                   params={"cik": cik}, timeout=30)
+        if search_resp.status_code != 200:
+            return {"error": f"EDGAR search failed: HTTP {search_resp.status_code}",
+                    "answer": f"Could not search EDGAR for CIK {cik}. Is the EDGAR Loader running at {loader_url}?"}
+
+        search_data = search_resp.json()
+        if search_data.get("error"):
+            return {"error": search_data["error"], "answer": f"EDGAR search error: {search_data['error']}"}
+
+        company = search_data.get("company", {})
+        company_name = company.get("name", f"CIK {cik}")
+        filings = search_data.get("filings", [])
+
+        # Step 1b: Detect fund type for better plan building
+        fund_type = params.get("fund_type", "Unknown")
+        if fund_type == "Unknown":
+            try:
+                dt_resp = requests.post(f"{loader_url}/api/detect-fund-type", json={
+                    "content": "", "company_name": company_name,
+                    "entity_type": company.get("entityType", ""),
+                    "sic": company.get("sic", ""),
+                    "filing_type": "", "filing_forms": [f.get("form", "") for f in filings[:40]],
+                }, timeout=15)
+                if dt_resp.status_code == 200:
+                    fund_type = dt_resp.json().get("fund_type", "Unknown")
+                    print(f"  [extract] Detected fund type: {fund_type}")
+            except Exception:
+                pass
+
+        # Step 2: Build a plan using Smart Fetch
+        plan_resp = requests.post(f"{loader_url}/api/smart-fetch/plan", json={
+            "cik": cik,
+            "fund_type": fund_type,
+            "domains": domains,
+            "period_type": period,
+            "year": params.get("year"),
+            "quarter": params.get("quarter"),
+        }, timeout=30)
+
+        if plan_resp.status_code != 200:
+            return {"error": f"Plan failed: HTTP {plan_resp.status_code}",
+                    "answer": f"Could not build extraction plan for {company_name}."}
+
+        plan_data = plan_resp.json()
+        plan = plan_data.get("plan", [])
+
+        if not plan:
+            return {"answer": f"No filings found for {company_name} matching the requested domains ({', '.join(domains)}) and period ({period}). The company has {len(filings)} total filings on EDGAR."}
+
+        filing_summary = ", ".join(f"{p['filing_type']} ({len(p.get('domains', []))} domains)" for p in plan)
+
+        # Step 3: Execute the plan
+        exec_resp = requests.post(f"{loader_url}/api/smart-fetch/execute", json={
+            "cik": cik,
+            "company_name": company_name,
+            "plan": plan,
+            "entity_type": company.get("entityType", ""),
+            "sic": company.get("sic", ""),
+            "sic_description": company.get("sicDescription", ""),
+        }, timeout=300)
+
+        if exec_resp.status_code != 200:
+            return {"error": f"Execution failed: HTTP {exec_resp.status_code}",
+                    "answer": f"Extraction plan was built ({filing_summary}) but execution failed."}
+
+        exec_data = exec_resp.json()
+        results = exec_data.get("results", [])
+
+        # Build summary
+        total_rows = sum(r.get("row_count", 0) for r in results)
+        domain_summary = "\n".join(f"- **{r.get('domain_name', r.get('domain_id', '?'))}**: {r.get('row_count', 0)} rows" for r in results)
+
+        answer = (
+            f"✅ Extraction complete for **{company_name}** (CIK {cik}, {fund_type}).\n\n"
+            f"Fetched {len(plan)} filing(s) ({filing_summary}), extracted {len(results)} domain(s) with **{total_rows} total rows**.\n\n"
+            f"{domain_summary}\n\n"
+            f"The data is now on the **Review** tab in the EDGAR Loader for approval."
+        )
+
+        return {"answer": answer, "results": results}
+
+    except requests.exceptions.ConnectionError:
+        return {"error": "Cannot connect to EDGAR Loader",
+                "answer": f"Cannot connect to the EDGAR Loader at {loader_url}. Make sure it's running on port {loader_url.split(':')[-1]}."}
+    except Exception as e:
+        return {"error": str(e), "answer": f"Extraction failed: {e}"}
+
+
 @app.route("/api/ask", methods=["POST"])
 def api_ask():
     """Main chatbot endpoint: NL question → SQL → results → NL answer."""
@@ -538,25 +741,37 @@ def api_ask():
         # Load conversation history
         conv = load_conversation(conv_id) if conv_id else {"id": datetime.utcnow().strftime("%Y%m%d_%H%M%S"), "turns": []}
 
-        # Step 1: Translate NL → SQL
-        sql, sql_usage = nl_to_sql(question, conv.get("turns", []))
+        # Step 1: Translate NL → SQL or detect extraction intent
+        response_type, payload, sql_usage = nl_to_sql(question, conv.get("turns", []))
 
-        # Step 2: Execute SQL
-        try:
-            rows, columns = execute_sql(sql, max_rows=CONFIG["app"]["max_rows"])
-            error = None
-        except Exception as e:
-            rows, columns, error = [], [], str(e)
-
-        # Step 3: Summarize results in NL
-        if error:
-            answer = f"⚠️ Query failed: {error}\n\nSQL I tried:\n```sql\n{sql}\n```"
-            summary_usage = {}
-        elif not rows:
-            answer = f"No results found for your question.\n\n```sql\n{sql}\n```"
+        if response_type == "extract":
+            # Handle extraction request — call the EDGAR Loader API
+            extract_result = _trigger_extraction(payload)
+            sql = f"ACTION:EXTRACT:{json.dumps(payload, default=str)}"
+            answer = extract_result.get("answer", "Extraction triggered.")
+            rows = []
+            columns = []
+            error = extract_result.get("error")
             summary_usage = {}
         else:
-            answer, summary_usage = summarize_results(question, sql, rows, columns)
+            sql = payload
+
+            # Step 2: Execute SQL
+            try:
+                rows, columns = execute_sql(sql, max_rows=CONFIG["app"]["max_rows"])
+                error = None
+            except Exception as e:
+                rows, columns, error = [], [], str(e)
+
+            # Step 3: Summarize results in NL
+            if error:
+                answer = f"⚠️ Query failed: {error}\n\nSQL I tried:\n```sql\n{sql}\n```"
+                summary_usage = {}
+            elif not rows:
+                answer = f"No results found for your question.\n\n```sql\n{sql}\n```"
+                summary_usage = {}
+            else:
+                answer, summary_usage = summarize_results(question, sql, rows, columns)
 
         # Calculate cost
         model_id = CONFIG["anthropic"].get("model", "claude-sonnet-4-6")
@@ -688,6 +903,12 @@ def api_suggestions():
                 "Which funds have more than 20% in real estate?",
                 "Show geographic composition of all BDCs",
             ]},
+            {"category": "Extract New Data", "questions": [
+                "Extract returns for CIK 1920145 from the most recent filings",
+                "Pull NAV and distribution data for CIK 1869453",
+                "Fetch composition data for CIK 1803498 from 2024",
+                "Extract all domains for CIK 1920145",
+            ]},
         ]
     })
 
@@ -752,6 +973,8 @@ def api_settings_post():
             app_cur["max_rows"] = int(app_in["max_rows"] or 500)
         if "conversation_limit" in app_in:
             app_cur["conversation_limit"] = int(app_in["conversation_limit"] or 20)
+        if "loader_url" in app_in and app_in["loader_url"]:
+            app_cur["loader_url"] = app_in["loader_url"]
 
     # Models list — allow adding/removing/editing available models
     if "models" in data and isinstance(data["models"], list):
