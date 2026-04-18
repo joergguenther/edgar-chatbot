@@ -712,7 +712,8 @@ def _trigger_extraction(params):
 
         filing_summary = ", ".join(f"{p['filing_type']} ({len(p.get('domains', []))} domains)" for p in plan)
 
-        # Step 3: Execute the plan
+        # Step 3: Fetch filing content from EDGAR
+        print(f"  [extract] Step 3: Fetching {len(plan)} filing(s) from EDGAR...")
         exec_resp = requests.post(f"{loader_url}/api/smart-fetch/execute", json={
             "cik": cik,
             "company_name": company_name,
@@ -720,27 +721,121 @@ def _trigger_extraction(params):
             "entity_type": company.get("entityType", ""),
             "sic": company.get("sic", ""),
             "sic_description": company.get("sicDescription", ""),
-        }, timeout=300)
+            "fund_type": fund_type,
+            "deep_scan": True,
+        }, timeout=120)
 
         if exec_resp.status_code != 200:
-            return {"error": f"Execution failed: HTTP {exec_resp.status_code}",
-                    "answer": f"Extraction plan was built ({filing_summary}) but execution failed."}
+            return {"error": f"Filing fetch failed: HTTP {exec_resp.status_code}",
+                    "answer": f"Could not fetch filings for {company_name}."}
 
         exec_data = exec_resp.json()
-        results = exec_data.get("results", [])
+        ready_results = [r for r in exec_data.get("results", []) if r.get("status") == "ready"]
+
+        if not ready_results:
+            return {"answer": f"No filings could be fetched for {company_name}. Plan had {len(plan)} filing(s) but none were retrievable."}
+
+        # Step 4: Extract each domain from each filing via /api/extract
+        print(f"  [extract] Step 4: Extracting {len(domains)} domain(s) from {len(ready_results)} filing(s)...")
+        extraction_results = []
+        total_rows = 0
+
+        for filing_result in ready_results:
+            filing = filing_result.get("filing", {})
+            content = filing_result.get("content", "")
+            raw_content = filing_result.get("raw_content")
+            filing_url = filing_result.get("filing_url", "")
+            f_type = filing.get("form", filing_result.get("plan_item", {}).get("filing_type", ""))
+            accession = filing.get("accessionNumber", "")
+            domain_ids = filing_result.get("domains", [])
+
+            is_nport = f_type.upper().startswith("N-PORT")
+
+            for domain_id in domain_ids:
+                if domain_id not in domains:
+                    continue
+
+                print(f"  [extract]   → {domain_id} from {f_type} ({accession[:20]}...)...")
+
+                try:
+                    ext_resp = requests.post(f"{loader_url}/api/extract", json={
+                        "domain": domain_id,
+                        "content": raw_content if raw_content and is_nport else content,
+                        "cik": cik,
+                        "company_name": company_name,
+                        "accession": accession,
+                        "filing_type": f_type,
+                        "filing_url": filing_url,
+                        "entity_type": company.get("entityType", ""),
+                        "sic": company.get("sic", ""),
+                        "sic_description": company.get("sicDescription", ""),
+                        "fund_type": fund_type,
+                        "deep_scan": True,
+                        "check_filing_type": True,
+                        "check_relevance": True,
+                        "retry_on_empty": True,
+                        "check_thousands": True,
+                    }, timeout=300)
+
+                    if ext_resp.status_code == 200:
+                        ext_data = ext_resp.json()
+                        row_count = ext_data.get("row_count", 0)
+                        domain_name = ext_data.get("domain", domain_id)
+                        skipped = ext_data.get("skipped", False)
+                        skip_reason = ext_data.get("skip_reason", "")
+
+                        extraction_results.append({
+                            "domain_id": domain_id,
+                            "domain_name": domain_name,
+                            "row_count": row_count,
+                            "filing_type": f_type,
+                            "skipped": skipped,
+                            "skip_reason": skip_reason,
+                        })
+                        total_rows += row_count
+                        status = f"SKIPPED: {skip_reason}" if skipped else f"{row_count} rows"
+                        print(f"  [extract]     ✓ {domain_name}: {status}")
+                    else:
+                        extraction_results.append({
+                            "domain_id": domain_id,
+                            "domain_name": domain_id,
+                            "row_count": 0,
+                            "error": f"HTTP {ext_resp.status_code}",
+                        })
+                        print(f"  [extract]     ✗ {domain_id}: HTTP {ext_resp.status_code}")
+                except Exception as e:
+                    extraction_results.append({
+                        "domain_id": domain_id,
+                        "domain_name": domain_id,
+                        "row_count": 0,
+                        "error": str(e),
+                    })
+                    print(f"  [extract]     ✗ {domain_id}: {e}")
 
         # Build summary
-        total_rows = sum(r.get("row_count", 0) for r in results)
-        domain_summary = "\n".join(f"- **{r.get('domain_name', r.get('domain_id', '?'))}**: {r.get('row_count', 0)} rows" for r in results)
+        filing_types = sorted(set(r.get("filing_type", "") for r in extraction_results if r.get("filing_type")))
+        domain_lines = []
+        for r in extraction_results:
+            if r.get("skipped"):
+                domain_lines.append(f"- **{r['domain_name']}**: skipped ({r.get('skip_reason', '')})")
+            elif r.get("error"):
+                domain_lines.append(f"- **{r['domain_name']}**: ✗ error ({r['error']})")
+            else:
+                domain_lines.append(f"- **{r['domain_name']}**: {r['row_count']} rows")
 
-        answer = (
-            f"✅ Extraction complete for **{company_name}** (CIK {cik}, {fund_type}).\n\n"
-            f"Fetched {len(plan)} filing(s) ({filing_summary}), extracted {len(results)} domain(s) with **{total_rows} total rows**.\n\n"
-            f"{domain_summary}\n\n"
-            f"The data is now on the **Review** tab in the EDGAR Loader for approval."
-        )
+        extracted_count = sum(1 for r in extraction_results if r.get("row_count", 0) > 0)
+        skipped_count = sum(1 for r in extraction_results if r.get("skipped"))
 
-        return {"answer": answer, "results": results}
+        answer = f"✅ Extraction complete for **{company_name}** (CIK {cik}, {fund_type}).\n\n"
+        answer += f"Fetched {len(ready_results)} filing(s) ({', '.join(filing_types)}), "
+        answer += f"extracted **{total_rows} rows** across {extracted_count} domain(s)"
+        if skipped_count:
+            answer += f", {skipped_count} skipped by quality checks"
+        answer += f".\n\n"
+        answer += "\n".join(domain_lines)
+        answer += f"\n\nData is now on the **Review** tab in the EDGAR Loader for approval."
+
+        return {"answer": answer, "results": extraction_results}
 
     except requests.exceptions.ConnectionError:
         return {"error": "Cannot connect to EDGAR Loader",
