@@ -76,8 +76,9 @@ if not CONFIG.get("database", {}).get("password"):
 def get_conn():
     db = CONFIG["database"]
     if not db.get("password"):
+        print(f"  [db] ERROR: No password in CONFIG. Keys present: {list(db.keys())}")
         raise RuntimeError("Database password not configured. Open Settings to configure.")
-    print(f"[db] Connecting to {db['host']}:{db.get('port', 16149)}/{db['dbname']} as {db['user']}")
+    print(f"[db] Connecting to {db['host']}:{db.get('port', 16149)}/{db['dbname']} as {db['user']} (pw: {len(db['password'])} chars)")
     return psycopg2.connect(
         host=db["host"], port=db["port"],
         dbname=db["dbname"], user=db["user"],
@@ -951,8 +952,14 @@ def api_settings_post():
         # Password: only update if non-masked value provided
         if "password" in db_in:
             pw = db_in["password"]
+            print(f"  [settings] Password field received: {'[empty]' if not pw else '••••' if pw == '••••••••' else f'[{len(pw)} chars]'}")
             if pw and pw != "••••••••":
                 db_cur["password"] = pw
+                print(f"  [settings] Password SAVED ({len(pw)} chars)")
+            else:
+                print(f"  [settings] Password NOT updated (masked or empty)")
+        else:
+            print(f"  [settings] No password field in request")
 
     # Anthropic
     if "anthropic" in data:
@@ -982,6 +989,7 @@ def api_settings_post():
 
     save_config(cfg)
     CONFIG = cfg  # reload in-memory copy
+    print(f"  [settings] Config saved. DB password in CONFIG: {'YES (' + str(len(CONFIG['database'].get('password', ''))) + ' chars)' if CONFIG['database'].get('password') else 'NO/EMPTY'}")
     # Invalidate schema cache so next query re-introspects with new DB settings
     _SCHEMA_CACHE["context"] = None
     _SCHEMA_CACHE["updated"] = None
