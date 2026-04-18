@@ -1253,9 +1253,27 @@ function closeSettings() {
 async function refreshSchema() {
     const result = document.getElementById('dbTestResult');
     result.className = 'test-result show';
-    result.textContent = 'Introspecting database schema...';
+    result.textContent = 'Saving settings and introspecting database schema...';
     result.style.color = 'var(--text-muted)';
     try {
+        // Auto-save settings first (ensures password/credentials are stored)
+        await fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                database: gatherDbSettings(),
+                anthropic: {
+                    api_key: document.getElementById('settingsApiKey').value,
+                    model: document.getElementById('settingsModel').value,
+                },
+                app: {
+                    max_rows: parseInt(document.getElementById('settingsMaxRows').value) || 500,
+                    conversation_limit: parseInt(document.getElementById('settingsConvLimit').value) || 20,
+                    loader_url: document.getElementById('settingsLoaderUrl').value || 'http://localhost:5070',
+                },
+            }),
+        });
+
         const resp = await fetch('/api/schema/refresh', { method: 'POST' });
         const data = await resp.json();
         if (data.success) {
