@@ -343,10 +343,13 @@ def validate_sql_tables(sql):
 
 
 def nl_to_sql(question, conversation_history=None):
-    """Translate a natural language question into SQL — or detect extraction intent.
+    """Translate a natural language question into SQL — or detect action intent.
     Returns (response_type, payload, usage) where:
     - response_type='sql': payload is the SQL query string
     - response_type='extract': payload is a dict with extraction parameters
+    - response_type='edgar_search': payload is a dict with search parameters
+    - response_type='edgar_filing': payload is a dict with filing parameters
+    - response_type='web_search': payload is a dict with search query
     """
     history = conversation_history or []
 
@@ -366,62 +369,55 @@ def nl_to_sql(question, conversation_history=None):
     # Add extraction capability context
     extraction_ctx = """
 
-# EXTRACTION CAPABILITY
-You can trigger new data extractions from SEC EDGAR filings. If the user asks to
-"extract", "fetch", "pull", "get new data", "load data from EDGAR", or similar action
-verbs that imply getting NEW data from filings (not querying existing data), respond with
-a JSON action instead of SQL.
+# CAPABILITIES
+You have three modes of response depending on what the user needs:
 
-Format for extraction requests:
-ACTION:EXTRACT:{"cik": "0001920145", "domains": ["returns", "nav_pricing"], "period": "most_recent"}
+## MODE 1: SQL QUERY (default)
+For questions about data ALREADY in our database. Return ONLY a SELECT query.
+Examples: "Show NAV for CIK 1234", "Compare leverage across BDCs", "Latest distributions"
 
-You can also specify company_name instead of CIK — the system will look it up:
-ACTION:EXTRACT:{"company_name": "Blue Owl", "domains": ["returns"], "period": "most_recent"}
+## MODE 2: EXTRACTION (new data from EDGAR filings into our DB)
+When user wants to "extract", "fetch", "pull", "load" NEW structured data from SEC filings.
+Return: ACTION:EXTRACT:{"cik": "0001920145", "domains": ["returns"], "period": "most_recent"}
+Or: ACTION:EXTRACT:{"company_name": "Blue Owl", "domains": ["nav_pricing", "returns"], "period": "annual", "year": 2024}
 
-For time-specific extractions:
-ACTION:EXTRACT:{"cik": "0001920145", "domains": ["distributions"], "period": "quarter", "year": 2024, "quarter": 3}
-ACTION:EXTRACT:{"cik": "0001920145", "domains": ["returns", "fees"], "period": "annual", "year": 2024}
+Available domains: filing_master, nav_pricing, shares_outstanding, volatility, distributions,
+dist_ytd, dist_drip, dist_metrics, dist_tax, composition, comp_objectives, leverage,
+leverage_summary, leverage_covenant, returns, fees, repurchase_fees, investor_eligibility,
+offering_price, redemptions, tender_program, account_metrics, operational_details
 
-Available domains and what they extract:
-- filing_master → Fund regulatory filing metadata
-- nav_pricing → NAV per share, offering/repurchase prices
-- shares_outstanding → Shares outstanding per class
-- volatility → Volatility & risk metrics
-- distributions → Distribution history per share class
-- dist_ytd/dist_drip/dist_metrics/dist_tax → YTD totals, DRIP, metrics, tax character
-- composition/comp_objectives → Portfolio composition by asset type, geography, industry
-- leverage/leverage_summary/leverage_covenant → Debt facilities, ratios, covenant compliance
-- returns → Total return, period performance, benchmark comparison
-- fees → Management fees, expense ratios
-- repurchase_fees/investor_eligibility → Share class eligibility, repurchase fees
-- offering_price → Offering/repurchase prices per class
-- redemptions/liquidation_program/share_conversion → Liquidity programs
-- death_disability/sc_liquidity → Death/disability provisions, share class liquidity
-- interval_detail/interval_next_dates/interval_gates/interval_suspension/interval_early_withdrawal → Interval fund specifics
-- tender_program/tender_suspension/tender_next_dates → Tender offer specifics
-- account_metrics → Account-level metrics
-- operational_details → Service providers, board details
+## MODE 3: EDGAR SEARCH (browse filings on SEC EDGAR)
+When user asks "what filings does X have", "search EDGAR for", "look up CIK", "find filings".
+Return: ACTION:EDGAR_SEARCH:{"cik": "0001920145"}
+Or: ACTION:EDGAR_SEARCH:{"company_name": "Goldman Sachs Private Credit"}
+Or for full-text search: ACTION:EDGAR_SEARCH:{"query": "tender offer Blue Owl", "forms": "SC TO-I"}
 
-Period options: "most_recent" (default), "quarter" (needs year+quarter), "annual" (needs year)
+## MODE 4: EDGAR FILING (read a specific filing)
+When user asks to "read", "show me the filing", "what does the 10-K say about".
+Return: ACTION:EDGAR_FILING:{"cik": "0001920145", "filing_type": "10-K", "query": "total return"}
+Or: ACTION:EDGAR_FILING:{"cik": "0001920145", "accession": "0001193125-25-277550", "query": "leverage"}
+
+## MODE 5: WEB SEARCH (general internet search)
+When user asks about general market info, news, or anything not in our DB or EDGAR.
+Return: ACTION:WEB_SEARCH:{"query": "BDC industry trends 2025"}
 
 DECISION RULES:
-- "Show me NAV for CIK 1234" → SQL query (querying EXISTING data)
-- "Extract NAV for CIK 1234" → Extraction action (fetching NEW data from EDGAR)
-- "What's the latest distribution?" → SQL query
-- "Pull fresh distribution data from EDGAR for Blue Owl" → Extraction action
-- "Compare returns across all BDCs" → SQL query (analyzing existing data)
-- "Get returns data for CIK 1234 from the 2024 10-K" → Extraction action
+- "Show NAV for CIK 1234" → SQL (existing data)
+- "Extract NAV for CIK 1234" → EXTRACT (new data from filings)
+- "What filings does Blue Owl have?" → EDGAR_SEARCH
+- "What does the 10-K say about leverage?" → EDGAR_FILING
+- "What are current BDC market trends?" → WEB_SEARCH
+- "Look up CIK for Goldman Sachs" → EDGAR_SEARCH
+- "Read the latest 8-K for CIK 1920145" → EDGAR_FILING
 
-COMMON QUERY PATTERNS:
-- To find a company: JOIN with the reference portfolio table on "PortfolioID" which has "CompanyName" and "CIK"
-- NAV data: T_PE_FUND_SHARE_CLASS_NAV_PRICING has "NAVPS", "ReportDate"
-- Returns: T_PE_FUND_SHARE_CLASS_RETURNS has "Fund1Year", "FundYTD", "FundSinceInception"
-- Distributions: T_PE_FUND_SHARE_CLASS_DISTRIBUTION_HISTORY has "DistributionPerShare", "RecordDate"
-- Leverage: T_PE_FUND_LEVERAGE_DETAIL has facility-level debt; T_INST_PE_FUND_LEVERAGE_SUMMARY has totals
-- Extraction log: T_PE_FUND_EXTRACTION_LOG tracks all extractions with timestamps and costs
+COMMON SQL PATTERNS:
+- Company lookup: JOIN reference portfolio table on "PortfolioID" (has "PortfolioLongName", "CIK")
+- NAV: T_PE_FUND_SHARE_CLASS_NAV_PRICING."NAVPS", "ReportDate"
+- Returns: T_PE_FUND_SHARE_CLASS_RETURNS."Fund1Year", "FundYTD"
+- Distributions: T_PE_FUND_SHARE_CLASS_DISTRIBUTION_HISTORY."DistributionPerShare"
+- Extraction log: T_PE_FUND_EXTRACTION_LOG for timestamps and costs
 
-For SQL queries: respond with ONLY the SQL query, starting with SELECT.
-For extraction actions: respond with ONLY the ACTION:EXTRACT:{json} line."""
+Return ONLY one of: SELECT query | ACTION:EXTRACT:{json} | ACTION:EDGAR_SEARCH:{json} | ACTION:EDGAR_FILING:{json} | ACTION:WEB_SEARCH:{json}"""
 
     # Build messages
     messages = []
@@ -437,9 +433,13 @@ For extraction actions: respond with ONLY the ACTION:EXTRACT:{json} line."""
         "role": "user",
         "content": (
             f"Answer this request: {question}\n\n"
-            f"If this is a DATA QUERY (show, list, compare existing data): return ONLY a SELECT SQL query.\n"
-            f"If this is an EXTRACTION REQUEST (extract, fetch, pull new data from EDGAR): return ACTION:EXTRACT:{{json}}.\n"
-            f"Remember: every table MUST be referenced with its exact schema name, fully double-quoted."
+            f"Return ONLY one of:\n"
+            f"- A SELECT SQL query (for existing data)\n"
+            f"- ACTION:EXTRACT:{{json}} (for new extractions)\n"
+            f"- ACTION:EDGAR_SEARCH:{{json}} (to browse EDGAR filings)\n"
+            f"- ACTION:EDGAR_FILING:{{json}} (to read a specific filing)\n"
+            f"- ACTION:WEB_SEARCH:{{json}} (for internet search)\n"
+            f"Remember: SQL tables MUST use exact schema names, fully double-quoted."
         )
     })
 
@@ -451,14 +451,17 @@ For extraction actions: respond with ONLY the ACTION:EXTRACT:{json} line."""
         total_usage["input_tokens"] += usage.get("input_tokens", 0)
         total_usage["output_tokens"] += usage.get("output_tokens", 0)
 
-        # Check if this is an extraction action
-        if response.strip().startswith("ACTION:EXTRACT:"):
-            json_str = response.strip()[len("ACTION:EXTRACT:"):]
-            try:
-                extract_params = json.loads(json_str)
-                return "extract", extract_params, total_usage
-            except json.JSONDecodeError:
-                pass
+        response = response.strip()
+
+        # Check for any ACTION: prefix
+        action_match = re.search(r'ACTION:(EXTRACT|EDGAR_SEARCH|EDGAR_FILING|WEB_SEARCH):\s*(\{.*\})', response, re.DOTALL)
+        if action_match:
+            action_type = action_match.group(1).lower()
+            json_str = action_match.group(2)
+            # Try to parse, with brace-depth repair
+            params = _parse_action_json(json_str)
+            if params is not None:
+                return action_type, params, total_usage
 
         # Otherwise treat as SQL
         sql = re.sub(r"^```(?:sql)?\s*", "", response)
@@ -591,6 +594,24 @@ app = Flask(__name__, template_folder=str(BASE_DIR / "templates"))
 @app.route("/")
 def index():
     return render_template("chatbot.html")
+
+
+def _parse_action_json(json_str):
+    """Parse JSON from an ACTION response, with brace-depth repair for trailing text."""
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        # Try brace-depth repair
+        depth = 0
+        for i, ch in enumerate(json_str):
+            if ch == '{': depth += 1
+            elif ch == '}': depth -= 1
+            if depth == 0 and i > 0:
+                try:
+                    return json.loads(json_str[:i+1])
+                except json.JSONDecodeError:
+                    break
+    return None
 
 
 def _trigger_extraction(params):
@@ -728,6 +749,248 @@ def _trigger_extraction(params):
         return {"error": str(e), "answer": f"Extraction failed: {e}"}
 
 
+EDGAR_HEADERS = {"User-Agent": "EXF Financial Data Solutions dev@exf-financial.com"}
+
+
+def _handle_edgar_search(params):
+    """Search EDGAR for company filings."""
+    cik = params.get("cik", "").strip()
+    company_name = params.get("company_name", "").strip()
+    query = params.get("query", "").strip()
+    forms = params.get("forms", "")
+
+    try:
+        if query:
+            # Full-text search via EDGAR EFTS
+            efts_url = "https://efts.sec.gov/LATEST/search-index"
+            efts_params = {"q": query, "dateRange": "custom", "startdt": "2023-01-01"}
+            if forms:
+                efts_params["forms"] = forms
+            resp = requests.get(efts_url, params=efts_params, headers=EDGAR_HEADERS, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                hits = data.get("hits", {}).get("hits", [])
+                total = data.get("hits", {}).get("total", {}).get("value", 0)
+                results = []
+                for h in hits[:15]:
+                    src = h.get("_source", {})
+                    results.append({
+                        "form": src.get("root_forms", [""])[0],
+                        "company": src.get("display_names", [""])[0],
+                        "date": src.get("file_date", ""),
+                        "accession": h.get("_id", "").split(":")[0],
+                    })
+                lines = "\n".join(f"- **{r['form']}** — {r['company']} — {r['date']} (Accession: `{r['accession']}`)" for r in results)
+                return {"answer": f"Found **{total}** result(s) on EDGAR for \"{query}\"{' (form: ' + forms + ')' if forms else ''}:\n\n{lines}\n\n{'Showing first 15.' if total > 15 else ''}"}
+            else:
+                return {"answer": f"EDGAR full-text search failed (HTTP {resp.status_code})."}
+
+        elif cik or company_name:
+            # Company search via submissions API
+            if not cik and company_name:
+                # Try to find CIK from company name via EDGAR company search
+                search_url = f"https://efts.sec.gov/LATEST/search-index?q=%22{requests.utils.quote(company_name)}%22&dateRange=custom&startdt=2020-01-01"
+                resp = requests.get(search_url, headers=EDGAR_HEADERS, timeout=15)
+                if resp.status_code == 200:
+                    hits = resp.json().get("hits", {}).get("hits", [])
+                    if hits:
+                        # Extract CIK from first result
+                        ciks = hits[0].get("_source", {}).get("ciks", [])
+                        if ciks:
+                            cik = ciks[0].lstrip("0")
+
+            if not cik:
+                return {"answer": f"Could not find CIK for '{company_name}'. Try providing the CIK directly."}
+
+            sub_url = f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
+            resp = requests.get(sub_url, headers=EDGAR_HEADERS, timeout=30)
+            if resp.status_code != 200:
+                return {"answer": f"EDGAR submissions lookup failed for CIK {cik} (HTTP {resp.status_code})."}
+
+            data = resp.json()
+            name = data.get("name", f"CIK {cik}")
+            entity_type = data.get("entityType", "")
+            sic = data.get("sic", "")
+            sic_desc = data.get("sicDescription", "")
+
+            recent = data.get("filings", {}).get("recent", {})
+            filing_count = len(recent.get("accessionNumber", []))
+
+            # Show recent filings (last 15)
+            filings = []
+            for i in range(min(15, filing_count)):
+                filings.append({
+                    "form": recent.get("form", [])[i] if i < len(recent.get("form", [])) else "",
+                    "date": recent.get("filingDate", [])[i] if i < len(recent.get("filingDate", [])) else "",
+                    "accession": recent.get("accessionNumber", [])[i] if i < len(recent.get("accessionNumber", [])) else "",
+                    "doc": recent.get("primaryDocument", [])[i] if i < len(recent.get("primaryDocument", [])) else "",
+                })
+
+            lines = "\n".join(f"- **{f['form']}** — {f['date']} — `{f['accession']}`" for f in filings)
+            # Count by form type
+            form_counts = {}
+            for i in range(filing_count):
+                form = recent.get("form", [])[i] if i < len(recent.get("form", [])) else ""
+                form_counts[form] = form_counts.get(form, 0) + 1
+            top_forms = ", ".join(f"{k}: {v}" for k, v in sorted(form_counts.items(), key=lambda x: -x[1])[:8])
+
+            return {
+                "answer": (
+                    f"**{name}** (CIK {cik})\n"
+                    f"Entity: {entity_type} · SIC: {sic} ({sic_desc})\n"
+                    f"Total filings: **{filing_count}** ({top_forms})\n\n"
+                    f"**Recent filings:**\n{lines}"
+                ),
+                "rows": filings,
+                "columns": ["form", "date", "accession"],
+            }
+        else:
+            return {"answer": "Please provide a CIK, company name, or search query."}
+
+    except Exception as e:
+        return {"answer": f"EDGAR search failed: {e}"}
+
+
+def _handle_edgar_filing(params):
+    """Fetch and summarize a specific EDGAR filing."""
+    cik = params.get("cik", "").strip()
+    accession = params.get("accession", "").strip()
+    filing_type = params.get("filing_type", "").strip()
+    query = params.get("query", "").strip()
+
+    if not cik:
+        return {"answer": "I need a CIK number to look up filings."}
+
+    try:
+        # Find the filing
+        sub_url = f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
+        resp = requests.get(sub_url, headers=EDGAR_HEADERS, timeout=30)
+        if resp.status_code != 200:
+            return {"answer": f"EDGAR lookup failed for CIK {cik}."}
+
+        data = resp.json()
+        name = data.get("name", f"CIK {cik}")
+        recent = data.get("filings", {}).get("recent", {})
+
+        # Find the target filing
+        target_idx = None
+        for i in range(len(recent.get("accessionNumber", []))):
+            if accession and recent["accessionNumber"][i] == accession:
+                target_idx = i
+                break
+            if filing_type and recent.get("form", [])[i].upper() == filing_type.upper():
+                target_idx = i
+                break  # first match = most recent
+
+        if target_idx is None:
+            return {"answer": f"No {'filing ' + accession if accession else filing_type + ' filing'} found for {name}."}
+
+        acc = recent["accessionNumber"][target_idx]
+        form = recent.get("form", [])[target_idx]
+        date = recent.get("filingDate", [])[target_idx]
+        doc = recent.get("primaryDocument", [])[target_idx]
+        acc_nodashes = acc.replace("-", "")
+
+        # Fetch the filing content
+        if doc:
+            doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik.zfill(10)}/{acc_nodashes}/{doc}"
+        else:
+            doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik.zfill(10)}/{acc_nodashes}/{acc}-index.htm"
+
+        print(f"  [edgar_filing] Fetching {doc_url}")
+        doc_resp = requests.get(doc_url, headers=EDGAR_HEADERS, timeout=60)
+        if doc_resp.status_code != 200:
+            return {"answer": f"Could not fetch filing content (HTTP {doc_resp.status_code})."}
+
+        # Strip HTML to text
+        text = re.sub(r'<style[^>]*>.*?</style>', '', doc_resp.text, flags=re.DOTALL)
+        text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'&nbsp;', ' ', text)
+        text = re.sub(r'&amp;', '&', text)
+        text = re.sub(r'&#\d+;', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        # If there's a specific query, search for relevant sections
+        if query:
+            # Find paragraphs containing the query terms
+            terms = query.lower().split()
+            sentences = text.split('. ')
+            relevant = [s for s in sentences if any(t in s.lower() for t in terms)]
+            if relevant:
+                excerpt = '. '.join(relevant[:10])[:3000]
+            else:
+                excerpt = text[:3000]
+        else:
+            excerpt = text[:3000]
+
+        # Use Claude to summarize
+        summary_prompt = f"""Filing: {form} filed {date} by {name} (CIK {cik}, Accession {acc})
+{f'User is asking about: {query}' if query else 'Provide a general summary.'}
+
+Filing excerpt ({len(text):,} total chars):
+{excerpt}
+
+Summarize the key information from this filing{f' related to "{query}"' if query else ''}. Be specific with numbers and dates."""
+
+        summary, s_usage = call_claude(
+            [{"role": "user", "content": summary_prompt}],
+            system="You are an SEC filing analyst. Summarize filings concisely, focusing on key data points.",
+            max_tokens=1500,
+        )
+
+        filing_url = f"https://www.sec.gov/Archives/edgar/data/{cik.zfill(10)}/{acc_nodashes}/{doc or acc + '-index.htm'}"
+
+        return {
+            "answer": (
+                f"**{form}** — {name} — Filed {date}\n"
+                f"Accession: `{acc}` · [View on EDGAR]({filing_url})\n\n"
+                f"{summary}"
+            ),
+            "usage": s_usage,
+        }
+
+    except Exception as e:
+        return {"answer": f"Filing retrieval failed: {e}"}
+
+
+def _handle_web_search(params):
+    """Search the web for general information."""
+    query = params.get("query", "").strip()
+    if not query:
+        return {"answer": "Please provide a search query."}
+
+    try:
+        # Use EDGAR EFTS as primary search (SEC-focused)
+        efts_url = "https://efts.sec.gov/LATEST/search-index"
+        resp = requests.get(efts_url, params={"q": query, "dateRange": "custom", "startdt": "2024-01-01"},
+                           headers=EDGAR_HEADERS, timeout=15)
+
+        results_text = ""
+        if resp.status_code == 200:
+            data = resp.json()
+            hits = data.get("hits", {}).get("hits", [])
+            total = data.get("hits", {}).get("total", {}).get("value", 0)
+            if hits:
+                lines = []
+                for h in hits[:8]:
+                    src = h.get("_source", {})
+                    lines.append(f"- {src.get('display_names', [''])[0]} — {src.get('root_forms', [''])[0]} — {src.get('file_date', '')}")
+                results_text = f"\n\n**Related SEC filings ({total} found):**\n" + "\n".join(lines)
+
+        # Use Claude to provide a knowledgeable answer
+        answer, usage = call_claude(
+            [{"role": "user", "content": f"Answer this question about financial markets, SEC regulations, or fund industry: {query}\n\nBe specific and factual. If you're not sure, say so."}],
+            system="You are a financial data expert specializing in SEC filings, BDCs, REITs, interval funds, and alternative investments. Provide factual, concise answers.",
+            max_tokens=1500,
+        )
+
+        return {"answer": answer + results_text, "usage": usage}
+
+    except Exception as e:
+        return {"answer": f"Search failed: {e}"}
+
+
 @app.route("/api/ask", methods=["POST"])
 def api_ask():
     """Main chatbot endpoint: NL question → SQL → results → NL answer."""
@@ -742,19 +1005,43 @@ def api_ask():
         # Load conversation history
         conv = load_conversation(conv_id) if conv_id else {"id": datetime.utcnow().strftime("%Y%m%d_%H%M%S"), "turns": []}
 
-        # Step 1: Translate NL → SQL or detect extraction intent
+        # Step 1: Translate NL → SQL or detect action intent
         response_type, payload, sql_usage = nl_to_sql(question, conv.get("turns", []))
 
+        rows = []
+        columns = []
+        error = None
+        summary_usage = {}
+
         if response_type == "extract":
-            # Handle extraction request — call the EDGAR Loader API
-            extract_result = _trigger_extraction(payload)
+            result = _trigger_extraction(payload)
             sql = f"ACTION:EXTRACT:{json.dumps(payload, default=str)}"
-            answer = extract_result.get("answer", "Extraction triggered.")
-            rows = []
-            columns = []
-            error = extract_result.get("error")
-            summary_usage = {}
+            answer = result.get("answer", "Extraction triggered.")
+            error = result.get("error")
+            summary_usage = result.get("usage", {})
+
+        elif response_type == "edgar_search":
+            result = _handle_edgar_search(payload)
+            sql = f"ACTION:EDGAR_SEARCH:{json.dumps(payload, default=str)}"
+            answer = result.get("answer", "Search complete.")
+            rows = result.get("rows", [])
+            columns = result.get("columns", [])
+            summary_usage = result.get("usage", {})
+
+        elif response_type == "edgar_filing":
+            result = _handle_edgar_filing(payload)
+            sql = f"ACTION:EDGAR_FILING:{json.dumps(payload, default=str)}"
+            answer = result.get("answer", "Filing retrieved.")
+            summary_usage = result.get("usage", {})
+
+        elif response_type == "web_search":
+            result = _handle_web_search(payload)
+            sql = f"ACTION:WEB_SEARCH:{json.dumps(payload, default=str)}"
+            answer = result.get("answer", "Search complete.")
+            summary_usage = result.get("usage", {})
+
         else:
+            # SQL query
             sql = payload
 
             # Step 2: Execute SQL
