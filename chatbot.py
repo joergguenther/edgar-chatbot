@@ -610,8 +610,8 @@ def _trigger_extraction(params):
             ref_schema = CONFIG["database"].get("reference_schema", "newdev_public_equity")
             with conn.cursor() as cur:
                 cur.execute(f'''
-                    SELECT "CIK", "CompanyName" FROM "{ref_schema}"."T_PORT_PORTFOLIO"
-                    WHERE "CompanyName" ILIKE %s
+                    SELECT "CIK", "PortfolioLongName" FROM "{ref_schema}"."T_PORT_PORTFOLIO"
+                    WHERE "PortfolioLongName" ILIKE %s
                     ORDER BY "PortfolioID" LIMIT 5
                 ''', (f'%{company_name}%',))
                 matches = cur.fetchall()
