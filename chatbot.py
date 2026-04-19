@@ -847,6 +847,212 @@ def _trigger_extraction(params):
 EDGAR_HEADERS = {"User-Agent": "EXF Financial Data Solutions dev@exf-financial.com"}
 
 
+def _trigger_extraction_streaming(params):
+    """Generator version of _trigger_extraction — yields progress events."""
+    loader_url = CONFIG.get("app", {}).get("loader_url", "http://localhost:5070")
+    cik = params.get("cik", "").strip()
+    company_name = params.get("company_name", "").strip()
+    domains = params.get("domains", [])
+    period = params.get("period", "most_recent")
+
+    # Company name resolution
+    if not cik and company_name:
+        yield {"type": "progress", "message": f"🔍 Looking up '{company_name}' in database..."}
+        try:
+            conn = get_conn()
+            ref_schema = CONFIG["database"].get("reference_schema", "newdev_public_equity")
+            with conn.cursor() as cur:
+                cur.execute(f'''
+                    SELECT "CIK", "PortfolioLongName" FROM "{ref_schema}"."T_PORT_PORTFOLIO"
+                    WHERE "PortfolioLongName" ILIKE %s ORDER BY "PortfolioID" LIMIT 5
+                ''', (f'%{company_name}%',))
+                matches = cur.fetchall()
+            conn.close()
+            if matches and len(matches) == 1:
+                cik = str(matches[0][0])
+                company_name = matches[0][1]
+                yield {"type": "progress", "message": f"✓ Resolved: {company_name} → CIK {cik}"}
+            elif matches:
+                match_list = ", ".join(f"{m[1]} (CIK {m[0]})" for m in matches[:5])
+                yield {"type": "result", "answer": f"Multiple matches: {match_list}. Please specify the CIK."}
+                return
+            else:
+                yield {"type": "result", "answer": f"No portfolio found matching '{company_name}'."}
+                return
+        except Exception as e:
+            yield {"type": "result", "answer": f"Lookup failed: {e}"}
+            return
+
+    if not cik:
+        yield {"type": "result", "answer": "I need a CIK number or company name."}
+        return
+    if not domains:
+        yield {"type": "result", "answer": "Please specify which domains to extract."}
+        return
+
+    try:
+        # Step 1: Search EDGAR
+        yield {"type": "progress", "message": f"🔍 Searching EDGAR for CIK {cik}..."}
+        sr = requests.get(f"{loader_url}/api/edgar/search", params={"cik": cik}, timeout=30)
+        if sr.status_code != 200:
+            yield {"type": "result", "answer": f"EDGAR search failed. Is the Loader running at {loader_url}?"}
+            return
+        sd = sr.json()
+        if sd.get("error"):
+            yield {"type": "result", "answer": f"EDGAR error: {sd['error']}"}
+            return
+        company = sd.get("company", {})
+        name = company.get("name", f"CIK {cik}")
+        filings = sd.get("filings", [])
+        yield {"type": "progress", "message": f"✓ Found: {name} ({len(filings)} filings on EDGAR)"}
+
+        # Step 2: Detect fund type
+        fund_type = "Unknown"
+        try:
+            yield {"type": "progress", "message": "📋 Detecting fund type..."}
+            dt = requests.post(f"{loader_url}/api/detect-fund-type", json={
+                "content": "", "company_name": name,
+                "entity_type": company.get("entityType", ""),
+                "sic": company.get("sic", ""),
+                "filing_type": "", "filing_forms": [f.get("form", "") for f in filings[:40]],
+            }, timeout=15).json()
+            fund_type = dt.get("fund_type", "Unknown")
+            yield {"type": "progress", "message": f"✓ Fund type: {fund_type}"}
+        except Exception:
+            yield {"type": "progress", "message": "⚠ Fund type detection failed, using Unknown"}
+
+        # Step 3: Build plan
+        yield {"type": "progress", "message": f"📝 Building extraction plan for {len(domains)} domain(s)..."}
+        pr = requests.post(f"{loader_url}/api/smart-fetch/plan", json={
+            "cik": cik, "fund_type": fund_type, "domains": domains,
+            "period_type": period, "year": params.get("year"), "quarter": params.get("quarter"),
+        }, timeout=30)
+        plan = pr.json().get("plan", []) if pr.status_code == 200 else []
+        if not plan:
+            yield {"type": "result", "answer": f"No filings found for {name} matching domains ({', '.join(domains)})."}
+            return
+        filing_types = [p['filing_type'] for p in plan]
+        total_domains = sum(len(p.get('domains', [])) for p in plan)
+        yield {"type": "progress", "message": f"✓ Plan: {len(plan)} filing(s) ({', '.join(filing_types)}), {total_domains} domain extraction(s)"}
+
+        # Step 4: Fetch filings from EDGAR
+        yield {"type": "progress", "message": f"📥 Fetching filing content from EDGAR..."}
+        er = requests.post(f"{loader_url}/api/smart-fetch/execute", json={
+            "cik": cik, "company_name": name, "plan": plan,
+            "entity_type": company.get("entityType", ""),
+            "sic": company.get("sic", ""),
+            "sic_description": company.get("sicDescription", ""),
+            "fund_type": fund_type, "deep_scan": True,
+        }, timeout=120)
+        if er.status_code != 200:
+            yield {"type": "result", "answer": f"Filing fetch failed (HTTP {er.status_code})."}
+            return
+        ready_results = [r for r in er.json().get("results", []) if r.get("status") == "ready"]
+        if not ready_results:
+            yield {"type": "result", "answer": f"No filings could be fetched for {name}."}
+            return
+        total_content = sum(r.get("content_length", 0) for r in ready_results)
+        yield {"type": "progress", "message": f"✓ Fetched {len(ready_results)} filing(s) ({total_content:,} chars total)"}
+
+        # Step 5: Extract each domain
+        extraction_results = []
+        total_rows = 0
+        for fi, filing_result in enumerate(ready_results):
+            filing = filing_result.get("filing", {})
+            content = filing_result.get("content", "")
+            raw_content = filing_result.get("raw_content")
+            filing_url = filing_result.get("filing_url", "")
+            f_type = filing.get("form", filing_result.get("plan_item", {}).get("filing_type", ""))
+            accession = filing.get("accessionNumber", "")
+            domain_ids = filing_result.get("domains", [])
+            is_nport = f_type.upper().startswith("N-PORT")
+
+            for domain_id in domain_ids:
+                if domain_id not in domains:
+                    continue
+                yield {"type": "progress", "message": f"📊 Extracting {domain_id} from {f_type}..."}
+                try:
+                    ext_resp = requests.post(f"{loader_url}/api/extract", json={
+                        "domain": domain_id,
+                        "content": raw_content if raw_content and is_nport else content,
+                        "cik": cik, "company_name": name, "accession": accession,
+                        "filing_type": f_type, "filing_url": filing_url,
+                        "entity_type": company.get("entityType", ""),
+                        "sic": company.get("sic", ""),
+                        "sic_description": company.get("sicDescription", ""),
+                        "fund_type": fund_type, "deep_scan": True,
+                        "check_filing_type": True, "check_relevance": True,
+                        "retry_on_empty": True, "check_thousands": True,
+                    }, timeout=300)
+
+                    if ext_resp.status_code == 200:
+                        ext_data = ext_resp.json()
+                        row_count = ext_data.get("row_count", 0)
+                        domain_name = ext_data.get("domain", domain_id)
+                        skipped = ext_data.get("skipped", False)
+                        skip_reason = ext_data.get("skip_reason", "")
+                        ds_info = ext_data.get("deep_scan_info", {})
+
+                        # Report diagnostics
+                        diag_parts = []
+                        if ds_info.get("deep_scan"):
+                            diag_parts.append(f"deep scan {ds_info.get('original_size',0):,}→{ds_info.get('full_size',0):,} chars")
+                        if ds_info.get("smart_chunk"):
+                            diag_parts.append(f"smart chunk {ds_info.get('chunk_from',0):,}→{ds_info.get('chunk_to',0):,} chars")
+                        if ext_data.get("scale_multiplier", 1) != 1:
+                            diag_parts.append(f"×{ext_data['scale_multiplier']:,} multiplier")
+                        if ext_data.get("ml_corrections_applied", 0) > 0:
+                            diag_parts.append(f"{ext_data['ml_corrections_applied']} ML corrections")
+
+                        extraction_results.append({
+                            "domain_id": domain_id, "domain_name": domain_name,
+                            "row_count": row_count, "filing_type": f_type,
+                            "skipped": skipped, "skip_reason": skip_reason,
+                        })
+                        total_rows += row_count
+
+                        if skipped:
+                            yield {"type": "progress", "message": f"  ⏭ {domain_name}: skipped — {skip_reason}"}
+                        else:
+                            diag_str = f" ({', '.join(diag_parts)})" if diag_parts else ""
+                            yield {"type": "progress", "message": f"  ✓ {domain_name}: {row_count} rows{diag_str}"}
+                    else:
+                        extraction_results.append({"domain_id": domain_id, "domain_name": domain_id, "row_count": 0, "error": f"HTTP {ext_resp.status_code}"})
+                        yield {"type": "progress", "message": f"  ✗ {domain_id}: HTTP {ext_resp.status_code}"}
+                except Exception as e:
+                    extraction_results.append({"domain_id": domain_id, "domain_name": domain_id, "row_count": 0, "error": str(e)})
+                    yield {"type": "progress", "message": f"  ✗ {domain_id}: {str(e)[:100]}"}
+
+        # Build summary
+        f_types = sorted(set(r.get("filing_type", "") for r in extraction_results if r.get("filing_type")))
+        domain_lines = []
+        for r in extraction_results:
+            if r.get("skipped"):
+                domain_lines.append(f"- **{r['domain_name']}**: skipped ({r.get('skip_reason', '')})")
+            elif r.get("error"):
+                domain_lines.append(f"- **{r['domain_name']}**: ✗ error ({r['error']})")
+            else:
+                domain_lines.append(f"- **{r['domain_name']}**: {r['row_count']} rows")
+
+        extracted_count = sum(1 for r in extraction_results if r.get("row_count", 0) > 0)
+        skipped_count = sum(1 for r in extraction_results if r.get("skipped"))
+
+        answer = f"✅ Extraction complete for **{name}** (CIK {cik}, {fund_type}).\n\n"
+        answer += f"Fetched {len(ready_results)} filing(s) ({', '.join(f_types)}), "
+        answer += f"extracted **{total_rows} rows** across {extracted_count} domain(s)"
+        if skipped_count:
+            answer += f", {skipped_count} skipped"
+        answer += f".\n\n" + "\n".join(domain_lines)
+        answer += f"\n\nData is now on the **Review** tab in the EDGAR Loader for approval."
+
+        yield {"type": "result", "answer": answer, "results": extraction_results}
+
+    except requests.exceptions.ConnectionError:
+        yield {"type": "result", "answer": f"Cannot connect to the EDGAR Loader at {loader_url}. Make sure it's running."}
+    except Exception as e:
+        yield {"type": "result", "answer": f"Extraction failed: {e}"}
+
+
 def _handle_edgar_search(params):
     """Search EDGAR for company filings."""
     cik = params.get("cik", "").strip()
@@ -1088,19 +1294,145 @@ def _handle_web_search(params):
 
 @app.route("/api/ask", methods=["POST"])
 def api_ask():
-    """Main chatbot endpoint: NL question → SQL → results → NL answer."""
+    """Main chatbot endpoint: NL question → SQL → results → NL answer.
+    If Accept header includes text/event-stream, returns SSE with progress."""
     data = request.get_json()
     question = (data.get("question") or "").strip()
     conv_id = data.get("conversation_id", "")
+    stream = "text/event-stream" in request.headers.get("Accept", "")
 
     if not question:
         return jsonify({"error": "No question provided"}), 400
 
+    if stream:
+        return Response(_stream_ask(question, conv_id), content_type="text/event-stream")
+    else:
+        return _ask_sync(question, conv_id)
+
+
+def _sse_event(data_dict):
+    """Format a dict as an SSE event."""
+    return f"data: {json.dumps(data_dict, default=str)}\n\n"
+
+
+def _stream_ask(question, conv_id):
+    """Generator for SSE streaming responses."""
     try:
-        # Load conversation history
         conv = load_conversation(conv_id) if conv_id else {"id": datetime.utcnow().strftime("%Y%m%d_%H%M%S"), "turns": []}
 
-        # Step 1: Translate NL → SQL or detect action intent
+        yield _sse_event({"type": "progress", "message": "🧠 Analyzing your question..."})
+
+        response_type, payload, sql_usage = nl_to_sql(question, conv.get("turns", []))
+
+        if response_type == "extract":
+            yield _sse_event({"type": "progress", "message": "📋 Extraction request detected — starting pipeline..."})
+            # Stream extraction with progress
+            result = {}
+            for event in _trigger_extraction_streaming(payload):
+                if event.get("type") == "progress":
+                    yield _sse_event(event)
+                elif event.get("type") == "result":
+                    result = event
+            sql = f"ACTION:EXTRACT:{json.dumps(payload, default=str)}"
+            answer = result.get("answer", "Extraction triggered.")
+            rows, columns, error = [], [], result.get("error")
+            summary_usage = {}
+
+        elif response_type == "edgar_search":
+            yield _sse_event({"type": "progress", "message": "🔍 Searching SEC EDGAR..."})
+            result = _handle_edgar_search(payload)
+            sql = f"ACTION:EDGAR_SEARCH:{json.dumps(payload, default=str)}"
+            answer = result.get("answer", "Search complete.")
+            rows, columns = result.get("rows", []), result.get("columns", [])
+            error = None
+            summary_usage = result.get("usage", {})
+
+        elif response_type == "edgar_filing":
+            yield _sse_event({"type": "progress", "message": "📄 Fetching filing from EDGAR..."})
+            result = _handle_edgar_filing(payload)
+            sql = f"ACTION:EDGAR_FILING:{json.dumps(payload, default=str)}"
+            answer = result.get("answer", "Filing retrieved.")
+            rows, columns, error = [], [], None
+            summary_usage = result.get("usage", {})
+
+        elif response_type == "web_search":
+            yield _sse_event({"type": "progress", "message": "🌐 Searching the web..."})
+            result = _handle_web_search(payload)
+            sql = f"ACTION:WEB_SEARCH:{json.dumps(payload, default=str)}"
+            answer = result.get("answer", "Search complete.")
+            rows, columns, error = [], [], None
+            summary_usage = result.get("usage", {})
+
+        else:
+            # SQL query
+            sql = payload
+            yield _sse_event({"type": "progress", "message": f"🔎 Running SQL query..."})
+
+            try:
+                rows, columns = execute_sql(sql, max_rows=CONFIG["app"]["max_rows"])
+                error = None
+            except Exception as e:
+                rows, columns, error = [], [], str(e)
+
+            if error:
+                answer = f"⚠️ Query failed: {error}\n\nSQL I tried:\n```sql\n{sql}\n```"
+                summary_usage = {}
+            elif not rows:
+                answer = f"No results found for your question.\n\n```sql\n{sql}\n```"
+                summary_usage = {}
+            else:
+                yield _sse_event({"type": "progress", "message": f"📊 Got {len(rows)} row(s) — summarizing..."})
+                answer, summary_usage = summarize_results(question, sql, rows, columns)
+
+        # Build final response (same format as sync)
+        model_id = CONFIG["anthropic"].get("model", "claude-sonnet-4-6")
+        total_input = sql_usage.get("input_tokens", 0) + summary_usage.get("input_tokens", 0)
+        total_output = sql_usage.get("output_tokens", 0) + summary_usage.get("output_tokens", 0)
+        sql_cost = calc_cost(sql_usage.get("input_tokens", 0), sql_usage.get("output_tokens", 0), model_id)
+        summary_cost = calc_cost(summary_usage.get("input_tokens", 0), summary_usage.get("output_tokens", 0), model_id)
+        total_cost = round(sql_cost + summary_cost, 6)
+
+        turn = {
+            "user": question, "assistant_sql": sql, "assistant_answer": answer,
+            "row_count": len(rows), "columns": columns, "rows_preview": rows[:20],
+            "timestamp": datetime.utcnow().isoformat(), "error": error, "model": model_id,
+            "usage": {
+                "sql_input_tokens": sql_usage.get("input_tokens", 0),
+                "sql_output_tokens": sql_usage.get("output_tokens", 0),
+                "summary_input_tokens": summary_usage.get("input_tokens", 0),
+                "summary_output_tokens": summary_usage.get("output_tokens", 0),
+                "total_input_tokens": total_input, "total_output_tokens": total_output,
+                "sql_cost_usd": sql_cost, "summary_cost_usd": summary_cost, "total_cost_usd": total_cost,
+            }
+        }
+        conv["turns"].append(turn)
+        save_conversation(conv)
+
+        conv_total_cost = sum(t.get("usage", {}).get("total_cost_usd", 0) for t in conv["turns"])
+
+        yield _sse_event({
+            "type": "done",
+            "conversation_id": conv["id"],
+            "question": question, "sql": sql, "answer": answer,
+            "row_count": len(rows), "columns": columns, "rows": rows[:100],
+            "total_rows": len(rows), "error": error, "model": model_id,
+            "usage": turn["usage"],
+            "conversation_totals": {
+                "total_cost_usd": round(conv_total_cost, 6),
+                "turn_count": len(conv["turns"]),
+            }
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        yield _sse_event({"type": "error", "error": f"Request failed: {e}"})
+
+
+def _ask_sync(question, conv_id):
+    """Synchronous (non-streaming) ask handler."""
+    try:
+        conv = load_conversation(conv_id) if conv_id else {"id": datetime.utcnow().strftime("%Y%m%d_%H%M%S"), "turns": []}
+
         response_type, payload, sql_usage = nl_to_sql(question, conv.get("turns", []))
 
         rows = []

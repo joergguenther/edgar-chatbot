@@ -858,6 +858,13 @@ function renderTurn(turn) {
     const costStr = cost > 0 ? formatCost(cost) : '';
     const tokensTitle = `Input: ${inTok.toLocaleString()} tokens · Output: ${outTok.toLocaleString()} tokens\nSQL: ${formatCost(usage.sql_cost_usd || 0)}\nSummary: ${formatCost(usage.summary_cost_usd || 0)}${turn.model ? '\nModel: ' + turn.model : ''}`;
 
+    // Progress log (from SSE streaming)
+    const progressId = 'prog_' + Math.random().toString(36).slice(2);
+    const progressHtml = turn._progress ? `
+        <div class="sql-panel" id="${progressId}" style="display:none;font-size:0.75rem;line-height:1.6;font-family:var(--mono);max-height:300px;overflow-y:auto">${turn._progress}</div>
+    ` : '';
+    const progressBtn = turn._progress ? `<button class="sql-toggle" onclick="toggleEl('${progressId}')">📋 Activity Log</button>` : '';
+
     return `
         <div class="turn">
             <div class="user-msg">${escapeHtml(turn.user)}</div>
@@ -868,10 +875,12 @@ function renderTurn(turn) {
                 <button class="sql-toggle" onclick="toggleEl('${sqlId}')">📝 SQL</button>
                 ${hasRows ? `<button class="sql-toggle" onclick="toggleEl('${tableId}')">📋 Table</button>` : ''}
                 ${hasRows ? `<button class="sql-toggle" onclick="toggleChart('${chartId}')">📈 Chart</button>` : ''}
+                ${progressBtn}
             </div>
             <div class="sql-panel" id="${sqlId}">${escapeHtml(turn.assistant_sql || '')}</div>
             ${tableHtml}
             ${chartHtml}
+            ${progressHtml}
         </div>
     `;
 }
@@ -1075,13 +1084,14 @@ async function sendQuestion() {
     document.getElementById('welcome').style.display = 'none';
     const messages = document.getElementById('messages');
 
-    // Show user message + thinking
-    const thinkingId = 'think_' + Math.random().toString(36).slice(2);
+    // Show user message + progress area
+    const turnId = 'turn_' + Math.random().toString(36).slice(2);
     messages.innerHTML += `
-        <div class="turn" id="${thinkingId}">
+        <div class="turn" id="${turnId}">
             <div class="user-msg">${escapeHtml(question)}</div>
-            <div class="assistant-msg">
+            <div class="assistant-msg" id="${turnId}_response">
                 <div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
+                <div id="${turnId}_progress" style="margin-top:0.5rem;font-size:0.78rem;color:var(--text-muted);font-family:var(--mono);line-height:1.6"></div>
             </div>
         </div>
     `;
@@ -1089,51 +1099,124 @@ async function sendQuestion() {
     autoGrow(input);
     scrollToBottom();
 
+    const progressEl = document.getElementById(turnId + '_progress');
+
     try {
         const resp = await fetch('/api/ask', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'text/event-stream',
+            },
             body: JSON.stringify({ question, conversation_id: currentConvId }),
         });
-        const data = await resp.json();
 
-        // Remove thinking indicator
-        document.getElementById(thinkingId)?.remove();
+        if (resp.headers.get('Content-Type')?.includes('text/event-stream')) {
+            // SSE streaming response
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let finalData = null;
 
-        if (data.error) {
-            messages.innerHTML += `
-                <div class="turn">
-                    <div class="user-msg">${escapeHtml(question)}</div>
-                    <div class="error-msg">${escapeHtml(data.error)}</div>
-                </div>
-            `;
-        } else {
-            currentConvId = data.conversation_id;
-            messages.innerHTML += renderTurn({
-                user: question,
-                assistant_answer: data.answer,
-                assistant_sql: data.sql,
-                row_count: data.row_count,
-                columns: data.columns,
-                rows_preview: data.rows,
-                usage: data.usage,
-                model: data.model,
-            });
-            loadConversations();
-            // Update session total cost
-            if (data.conversation_totals) {
-                const sc = document.getElementById('sessionCost');
-                const row = document.getElementById('sessionCostRow');
-                if (sc && row) {
-                    sc.textContent = formatCost(data.conversation_totals.total_cost_usd || 0);
-                    row.style.display = 'block';
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+
+                // Parse SSE events
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';  // Keep incomplete line
+
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    try {
+                        const event = JSON.parse(line.slice(6));
+                        if (event.type === 'progress') {
+                            progressEl.innerHTML += escapeHtml(event.message) + '<br>';
+                            scrollToBottom();
+                        } else if (event.type === 'done') {
+                            finalData = event;
+                        } else if (event.type === 'error') {
+                            finalData = { error: event.error };
+                        }
+                    } catch (e) { /* skip malformed event */ }
                 }
             }
-            loadAllTimeStats();
+
+            // Replace thinking + progress with final response
+            const turnEl = document.getElementById(turnId);
+            if (turnEl) turnEl.remove();
+
+            if (finalData && !finalData.error) {
+                currentConvId = finalData.conversation_id;
+                messages.innerHTML += renderTurn({
+                    user: question,
+                    assistant_answer: finalData.answer,
+                    assistant_sql: finalData.sql,
+                    row_count: finalData.row_count,
+                    columns: finalData.columns,
+                    rows_preview: finalData.rows,
+                    usage: finalData.usage,
+                    model: finalData.model,
+                    _progress: progressEl.innerHTML,
+                });
+                loadConversations();
+                if (finalData.conversation_totals) {
+                    const sc = document.getElementById('sessionCost');
+                    const row = document.getElementById('sessionCostRow');
+                    if (sc && row) {
+                        sc.textContent = formatCost(finalData.conversation_totals.total_cost_usd || 0);
+                        row.style.display = 'block';
+                    }
+                }
+                loadAllTimeStats();
+            } else if (finalData) {
+                messages.innerHTML += `
+                    <div class="turn">
+                        <div class="user-msg">${escapeHtml(question)}</div>
+                        <div class="error-msg">${escapeHtml(finalData.error)}</div>
+                    </div>
+                `;
+            }
+        } else {
+            // JSON response (fallback)
+            const data = await resp.json();
+            document.getElementById(turnId)?.remove();
+
+            if (data.error) {
+                messages.innerHTML += `
+                    <div class="turn">
+                        <div class="user-msg">${escapeHtml(question)}</div>
+                        <div class="error-msg">${escapeHtml(data.error)}</div>
+                    </div>
+                `;
+            } else {
+                currentConvId = data.conversation_id;
+                messages.innerHTML += renderTurn({
+                    user: question,
+                    assistant_answer: data.answer,
+                    assistant_sql: data.sql,
+                    row_count: data.row_count,
+                    columns: data.columns,
+                    rows_preview: data.rows,
+                    usage: data.usage,
+                    model: data.model,
+                });
+                loadConversations();
+                if (data.conversation_totals) {
+                    const sc = document.getElementById('sessionCost');
+                    const row = document.getElementById('sessionCostRow');
+                    if (sc && row) {
+                        sc.textContent = formatCost(data.conversation_totals.total_cost_usd || 0);
+                        row.style.display = 'block';
+                    }
+                }
+                loadAllTimeStats();
+            }
         }
         scrollToBottom();
     } catch(e) {
-        document.getElementById(thinkingId)?.remove();
+        document.getElementById(turnId)?.remove();
         messages.innerHTML += `
             <div class="error-msg">Request failed: ${escapeHtml(e.message)}</div>
         `;
